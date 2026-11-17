@@ -1,0 +1,93 @@
+# Visual Studio IDE files & Cache
+.vs
+.vscode
+.suo
+.user
+.userosscache
+.sln.docstates
+
+# Build & Compilation Outputs
+[Bb]in
+[Oo]bj
+[Dd]ebug
+[Rr]elease
+x64
+x86
+build
+
+# Publish Directories
+publish
+publish
+
+# NuGet Packages & Cache
+.nupkg
+packages
+.nuget
+
+# User-specific Environment  Secrets
+appsettings.Local.json
+appsettings..local.json
+secrets.json
+
+# Temporary & Log files
+.log
+.tmp
+.bak
+.swp
+.DotSettings.user
+
+
+# Visual Studio
+.vs
+.user
+.suo
+
+# Build output
+bin
+obj
+
+# Visual Studio Code
+.vscode
+
+# Buildlog files
+.log
+
+
+.vs
+.vscode
+
+bin
+obj
+
+node_modules
+dist
+.vite
+
+.env
+.env.local
+.env..local
+
+appsettings.Local.json
+secrets.json
+
+.user
+.suo
+
+.log
+.tmp
+.bak
+
+
+# Visual Studio user-specific project files
+*.csproj.user
+
+# ASP.NET
+appsettings.Development.json
+
+# Project generated folders
+Payroll_CRM_API.vs
+Payroll_CRM_APIbin
+Payroll_CRM_APIobj
+
+# Publish profiles
+Payroll_CRM_API/Properties/PublishProfiles/
