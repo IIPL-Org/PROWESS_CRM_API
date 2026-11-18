@@ -13,6 +13,8 @@ namespace PROWESS_CRM.Services
         Task<bool> IsActiveClientNameExistsAsync(string clientName, int? excludeClientId = null, CancellationToken cancellationToken = default);
         Task<bool> AssignModulesAsync(AssignModulesDto dto, CancellationToken cancellationToken = default);
         Task<bool> AssignESModulesAsync(AssignESModulesDto dto, CancellationToken cancellationToken = default);
+        Task<bool> AssignProwessModulesAsync(AssignProwessModulesDto dto, CancellationToken cancellationToken = default);
+
     }
 
     public class ClientService : IClientService
@@ -210,6 +212,18 @@ namespace PROWESS_CRM.Services
             return true;
         }
 
+        public async Task<bool> AssignProwessModulesAsync(AssignProwessModulesDto dto, CancellationToken cancellationToken = default)
+        {
+            var existingClient = await _clientRepository.GetClientByIdAsync(dto.ClientId, cancellationToken);
+            if (existingClient == null)
+            {
+                return false;
+            }
+
+            await _clientRepository.SaveClientProwessModulesAsync(dto.ClientId, dto.ModuleIds ?? new List<int>(), cancellationToken);
+            return true;
+        }
+
         public async Task<ClientResponseDto?> GetClientByIdAsync(int clientId, CancellationToken cancellationToken = default)
         {
             var client = await _clientRepository.GetClientByIdAsync(clientId, cancellationToken);
@@ -252,7 +266,8 @@ namespace PROWESS_CRM.Services
                 ModifiedBy = client.ModifiedBy,
                 ModifiedDate = client.ModifiedDate,
                 ModuleIds = client.ModuleIds ?? new List<int>(),
-                EsModuleIds = client.EsModuleIds ?? new List<int>()
+                EsModuleIds = client.EsModuleIds ?? new List<int>(),
+                ProwessModuleIds = client.ProwessModuleIds ?? new List<int>()
             };
         }
     }
