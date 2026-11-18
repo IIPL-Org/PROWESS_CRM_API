@@ -18,6 +18,9 @@ namespace PROWESS_CRM.Data
         Task SaveClientESModulesAsync(int clientId, List<int> moduleIds, CancellationToken cancellationToken = default);
         Task<List<int>> GetClientESModulesAsync(int clientId, CancellationToken cancellationToken = default);
         Task<Dictionary<int, List<int>>> GetAllClientESModulesAsync(CancellationToken cancellationToken = default);
+        Task SaveClientProwessModulesAsync(int clientId, List<int> moduleIds, CancellationToken cancellationToken = default);
+        Task<List<int>> GetClientProwessModulesAsync(int clientId, CancellationToken cancellationToken = default);
+        Task<Dictionary<int, List<int>>> GetAllClientProwessModulesAsync(CancellationToken cancellationToken = default);
     }
 
     public class ClientRepository : IClientRepository
@@ -107,6 +110,7 @@ namespace PROWESS_CRM.Data
                 reader.Close();
                 clientMaster.ModuleIds = await GetClientModulesAsync(clientId, cancellationToken);
                 clientMaster.EsModuleIds = await GetClientESModulesAsync(clientId, cancellationToken);
+                clientMaster.ProwessModuleIds = await GetClientProwessModulesAsync(clientId, cancellationToken);
                 return clientMaster;
             }
 
@@ -137,6 +141,8 @@ namespace PROWESS_CRM.Data
 
             var clientModules = await GetAllClientModulesAsync(cancellationToken);
             var clientEsModules = await GetAllClientESModulesAsync(cancellationToken);
+            var clientProwessModules = await GetAllClientProwessModulesAsync(cancellationToken);
+
             foreach (var client in clients)
             {
                 if (clientModules.TryGetValue(client.ClientId, out var moduleIds))
@@ -146,6 +152,10 @@ namespace PROWESS_CRM.Data
                 if (clientEsModules.TryGetValue(client.ClientId, out var esModuleIds))
                 {
                     client.EsModuleIds = esModuleIds;
+                }
+                if (clientProwessModules.TryGetValue(client.ClientId, out var prowessModuleIds))
+                {
+                    client.ProwessModuleIds = prowessModuleIds;
                 }
             }
 
@@ -372,5 +382,82 @@ namespace PROWESS_CRM.Data
             }
             return result;
         }
+
+
+        public async Task SaveClientProwessModulesAsync(int clientId, List<int> moduleIds, CancellationToken cancellationToken = default)
+        {
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+
+            // First delete existing mappings
+            using var deleteCommand = new SqlCommand("DELETE FROM Client_Prowess_Modules WHERE Client_Id = @Client_Id", connection);
+            deleteCommand.Parameters.AddWithValue("@Client_Id", clientId);
+            await deleteCommand.ExecuteNonQueryAsync(cancellationToken);
+
+            // Insert new mappings
+            if (moduleIds != null && moduleIds.Any())
+            {
+                foreach (var moduleId in moduleIds)
+                {
+                    using var insertCommand = new SqlCommand("INSERT INTO Client_Prowess_Modules (Client_Id, Module_Id) VALUES (@Client_Id, @Module_Id)", connection);
+                    insertCommand.Parameters.AddWithValue("@Client_Id", clientId);
+                    insertCommand.Parameters.AddWithValue("@Module_Id", moduleId);
+                    await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+        }
+
+        public async Task<List<int>> GetClientProwessModulesAsync(int clientId, CancellationToken cancellationToken = default)
+        {
+            var moduleIds = new List<int>();
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var command = new SqlCommand("SELECT Module_Id FROM Client_Prowess_Modules WHERE Client_Id = @Client_Id", connection);
+                command.Parameters.AddWithValue("@Client_Id", clientId);
+
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    moduleIds.Add(reader.GetInt32(0));
+                }
+            }
+            catch (SqlException ex) when (ex.Number == 208)
+            {
+                // Table Client_Prowess_Modules does not exist yet (pending setup script execution)
+                return new List<int>();
+            }
+            return moduleIds;
+        }
+
+        public async Task<Dictionary<int, List<int>>> GetAllClientProwessModulesAsync(CancellationToken cancellationToken = default)
+        {
+            var result = new Dictionary<int, List<int>>();
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var command = new SqlCommand("SELECT Client_Id, Module_Id FROM Client_Prowess_Modules", connection);
+
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    int clientId = reader.GetInt32(0);
+                    int moduleId = reader.GetInt32(1);
+
+                    if (!result.ContainsKey(clientId))
+                    {
+                        result[clientId] = new List<int>();
+                    }
+                    result[clientId].Add(moduleId);
+                }
+            }
+            catch (SqlException ex) when (ex.Number == 208)
+            {
+                // Table Client_Prowess_Modules does not exist yet (pending setup script execution)
+                return new Dictionary<int, List<int>>();
+            }
+            return result;
+        }
+
+
     }
 }
