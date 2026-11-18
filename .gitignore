@@ -82,7 +82,7 @@ secrets.json
 *.csproj.user
 
 # ASP.NET
-appsettings.Development.json
+#appsettings.Development.json
 
 # Project generated folders
 Payroll_CRM_API.vs
