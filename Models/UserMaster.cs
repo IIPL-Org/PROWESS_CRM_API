@@ -1,4 +1,4 @@
-﻿namespace PROWESS_CRM.Models
+namespace PROWESS_CRM.Models
 {
     /// <summary>
     /// Maps to dbo.UserMaster table for authentication and user profile storage
@@ -16,5 +16,15 @@
         public DateTime? UpdatedAt { get; set; }
         public DateTime? LastLogin { get; set; }
         public DateTime? LastLoginAt { get; set; }
+
+        /// <summary>
+        /// List of assigned Product Suite IDs from dbo.User_Products (e.g. [1, 2, 3, 4])
+        /// </summary>
+        public List<int> AssignedProductIds { get; set; } = new List<int>();
+
+        /// <summary>
+        /// Default Product Suite ID for login redirection (maps to dbo.User_Products.Is_Default)
+        /// </summary>
+        public int? DefaultProductId { get; set; }
     }
 }
