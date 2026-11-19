@@ -22,6 +22,8 @@ namespace PROWESS_CRM.Models
         public DateTime? ModifiedDate { get; set; }
         public List<int> ModuleIds { get; set; } = new List<int>();
         public List<int> EsModuleIds { get; set; } = new List<int>();
+        public List<int> ProwessModuleIds { get; set; } = new List<int>();
+
     }
 
     // Create DTO
@@ -131,6 +133,8 @@ namespace PROWESS_CRM.Models
         public DateTime? ModifiedDate { get; set; }
         public List<int> ModuleIds { get; set; } = new List<int>();
         public List<int> EsModuleIds { get; set; } = new List<int>();
+        public List<int> ProwessModuleIds { get; set; } = new List<int>();
+
     }
 
     // Generic API Response Wrapper

@@ -225,6 +225,58 @@ namespace PROWESS_CRM.Controllers
                     ApiResponse<IEnumerable<ClientResponseDto>>.FailureResponse("An internal error occurred while fetching clients."));
             }
         }
+
+
+
+        /// Assigns Prowess ERP modules to a specific client.
+        /// </summary>
+        [HttpPost("AssignProwessModules")]
+        [ProducesResponseType(typeof(ApiResponse<bool>), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(ApiResponse<bool>), StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(typeof(ApiResponse<bool>), StatusCodes.Status404NotFound)]
+        public async Task<IActionResult> AssignProwessModules([FromBody] AssignProwessModulesDto dto, CancellationToken cancellationToken)
+        {
+            if (!ModelState.IsValid)
+            {
+                var errors = ModelState.Values
+                    .SelectMany(v => v.Errors)
+                    .Select(e => e.ErrorMessage)
+                    .ToList();
+
+                return BadRequest(ApiResponse<bool>.FailureResponse("Validation failed.", errors));
+            }
+
+            try
+            {
+                bool assigned = await _clientService.AssignProwessModulesAsync(dto, cancellationToken);
+                if (!assigned)
+                {
+                    return NotFound(ApiResponse<bool>.FailureResponse($"Client with ID {dto.ClientId} not found."));
+                }
+
+                return Ok(ApiResponse<bool>.SuccessResponse(true, "Prowess modules assigned successfully."));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error assigning Prowess modules to client ID {ClientId}", dto.ClientId);
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    ApiResponse<bool>.FailureResponse("An internal error occurred while assigning Prowess modules."));
+            }
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     }
 }
 
