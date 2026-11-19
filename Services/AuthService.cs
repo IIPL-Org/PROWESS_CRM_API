@@ -1,4 +1,4 @@
-﻿using System.IdentityModel.Tokens.Jwt;
+using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.IdentityModel.Tokens;
@@ -46,11 +46,12 @@ namespace PROWESS_CRM.Services
             // 2. Multi-strategy Password Verification (SQL DecryptByPassPhrase / Plain Text, AES-256, BCrypt)
             bool isPasswordValid = false;
             string storedHash = user.PasswordHash ?? string.Empty;
+            string cleanStored = storedHash.Replace("\0", "").Trim();
 
             try
             {
-                // 2a. Direct plain text match (e.g. decrypted by SQL DecryptByPassPhrase "Admin@123" or "John@2026")
-                if (storedHash == request.Password)
+                // 2a. Direct plain text match (e.g. decrypted by SQL DecryptByPassPhrase "Admin@123" or "pranay@123")
+                if (cleanStored == request.Password || storedHash == request.Password)
                 {
                     isPasswordValid = true;
                 }
@@ -63,13 +64,13 @@ namespace PROWESS_CRM.Services
                 else if (!string.IsNullOrEmpty(storedHash))
                 {
                     string decryptedStoredPassword = PasswordEncryptionHelper.Decrypt(storedHash);
-                    isPasswordValid = (decryptedStoredPassword == request.Password);
+                    isPasswordValid = (decryptedStoredPassword == request.Password || decryptedStoredPassword.Replace("\0", "").Trim() == request.Password);
                 }
             }
             catch
             {
                 // Fallback direct match
-                isPasswordValid = (storedHash == request.Password);
+                isPasswordValid = (cleanStored == request.Password || storedHash == request.Password);
             }
 
             if (!isPasswordValid)
@@ -85,16 +86,45 @@ namespace PROWESS_CRM.Services
 
             // 5. Fetch accessible products for this user
             var permittedProducts = (await _productService.GetProductsForUserAsync(user.UserId)).ToList();
-            string activeProduct = "CRM";
-
-            if (!string.IsNullOrWhiteSpace(request.SelectedProductCode) && 
-                permittedProducts.Any(p => string.Equals(p.ProductCode, request.SelectedProductCode, StringComparison.OrdinalIgnoreCase)))
+            if (permittedProducts.Count == 0)
             {
-                activeProduct = request.SelectedProductCode.Trim().ToUpperInvariant();
+                return new LoginResponse
+                {
+                    Success = false,
+                    Message = "Access Denied: Your account does not have any product suites assigned. Please contact your administrator."
+                };
             }
-            else if (permittedProducts.Count > 0)
+
+            string activeProduct;
+
+            // Validate requested suite permissions if user specified a suite
+            if (!string.IsNullOrWhiteSpace(request.SelectedProductCode) && 
+                !string.Equals(request.SelectedProductCode, "AUTO", StringComparison.OrdinalIgnoreCase))
             {
-                activeProduct = permittedProducts[0].ProductCode;
+                var matchedProduct = permittedProducts.FirstOrDefault(p =>
+                    string.Equals(p.ProductCode, request.SelectedProductCode, StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(request.SelectedProductCode, "CRM", StringComparison.OrdinalIgnoreCase) && string.Equals(p.ProductCode, "ADMIN", StringComparison.OrdinalIgnoreCase)) ||
+                    (string.Equals(request.SelectedProductCode, "ADMIN", StringComparison.OrdinalIgnoreCase) && string.Equals(p.ProductCode, "CRM", StringComparison.OrdinalIgnoreCase))
+                );
+
+                if (matchedProduct == null)
+                {
+                    var allowedNames = string.Join(", ", permittedProducts.Select(p => p.ProductName));
+                    return new LoginResponse
+                    {
+                        Success = false,
+                        Message = $"Access Denied: You do not have permission to access '{request.SelectedProductCode}'. Your account only has access to: {allowedNames}."
+                    };
+                }
+
+                activeProduct = matchedProduct.ProductCode;
+            }
+            else
+            {
+                // Auto-detect default suite: prefer configured default suite, or first permitted
+                var defaultProd = permittedProducts.FirstOrDefault(p => user.DefaultProductId.HasValue && p.ProductId == user.DefaultProductId.Value)
+                                  ?? permittedProducts[0];
+                activeProduct = defaultProd.ProductCode;
             }
 
             // 6. Construct and return safe LoginResponse payload
