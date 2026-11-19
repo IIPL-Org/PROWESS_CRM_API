@@ -1,4 +1,4 @@
-﻿using System.Data;
+using System.Data;
 using Microsoft.Data.SqlClient;
 using PROWESS_CRM.Models;
 
@@ -26,28 +26,28 @@ namespace PROWESS_CRM.Data
             using var conn = await _connectionFactory.CreateConnectionAsync();
             using var cmd = conn.CreateCommand();
 
-            // Try running procedure sp_GetMenusByRoleAndProduct if available; otherwise fallback to sp_GetMenusByRole or SQL
             cmd.CommandText = @"
-                IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[sp_GetMenusByRoleAndProduct]') AND type in (N'P', N'PC'))
-                BEGIN
-                    EXEC [dbo].[sp_GetMenusByRoleAndProduct] @RoleName = @RoleName, @ProductCode = @ProductCode;
-                END
-                ELSE IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[sp_GetMenusByRole]') AND type in (N'P', N'PC'))
-                BEGIN
-                    EXEC [dbo].[sp_GetMenusByRole] @RoleName = @RoleName;
-                END
-                ELSE
-                BEGIN
-                    SELECT 
-                        MenuId, Title, Route, IconName, ParentId, SortOrder, Roles, IsActive, Category
-                    FROM dbo.MenuMaster
-                    WHERE IsActive = 1
-                    ORDER BY SortOrder ASC;
-                END";
+                SELECT 
+                    MenuId,
+                    MenuLabel AS Title,
+                    MenuPath AS Route,
+                    MenuIcon AS IconName,
+                    ParentMenuId AS ParentId,
+                    SortOrder,
+                    AllowedRoles AS Roles,
+                    IsActive,
+                    'Main' AS Category,
+                    Product_Code,
+                    Is_Common
+                FROM dbo.MenuMaster
+                WHERE IsActive = 1
+                  AND (@RoleName IS NULL OR AllowedRoles IS NULL OR AllowedRoles LIKE '%' + @RoleName + '%')
+                  AND (@ProductCode IS NULL OR Is_Common = 1 OR Product_Code IS NULL OR Product_Code = @ProductCode)
+                ORDER BY SortOrder ASC;";
 
             var paramRole = cmd.CreateParameter();
             paramRole.ParameterName = "@RoleName";
-            paramRole.Value = roleName ?? (object)DBNull.Value;
+            paramRole.Value = string.IsNullOrWhiteSpace(roleName) ? (object)DBNull.Value : roleName.Trim();
             cmd.Parameters.Add(paramRole);
 
             var paramProd = cmd.CreateParameter();
@@ -59,12 +59,6 @@ namespace PROWESS_CRM.Data
             while (await reader.ReadAsync())
             {
                 menus.Add(MapMenuFromReader(reader));
-            }
-
-            // In-memory safety filter in case the legacy SP was used
-            if (!string.IsNullOrWhiteSpace(productCode) && menus.Any(m => !string.IsNullOrEmpty(m.ProductCode) || m.IsCommon))
-            {
-                menus = menus.Where(m => m.IsCommon || string.IsNullOrEmpty(m.ProductCode) || string.Equals(m.ProductCode, productCode, StringComparison.OrdinalIgnoreCase)).ToList();
             }
 
             return menus;
@@ -80,16 +74,16 @@ namespace PROWESS_CRM.Data
             cmd.CommandText = @"
                 SELECT 
                     MenuId,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuLabel') IS NOT NULL THEN MenuLabel ELSE Title END AS Title,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuPath') IS NOT NULL THEN MenuPath ELSE Route END AS Route,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuIcon') IS NOT NULL THEN MenuIcon ELSE IconName END AS IconName,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'ParentMenuId') IS NOT NULL THEN ParentMenuId ELSE ParentId END AS ParentId,
+                    MenuLabel AS Title,
+                    MenuPath AS Route,
+                    MenuIcon AS IconName,
+                    ParentMenuId AS ParentId,
                     SortOrder,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'AllowedRoles') IS NOT NULL THEN AllowedRoles ELSE Roles END AS Roles,
+                    AllowedRoles AS Roles,
                     IsActive,
                     'Main' AS Category,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Product_Code') IS NOT NULL THEN Product_Code ELSE NULL END AS Product_Code,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Is_Common') IS NOT NULL THEN Is_Common ELSE CAST(0 AS BIT) END AS Is_Common
+                    Product_Code,
+                    Is_Common
                 FROM dbo.MenuMaster
                 WHERE IsActive = 1
                 ORDER BY SortOrder ASC;";

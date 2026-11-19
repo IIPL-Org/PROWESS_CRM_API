@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using PROWESS_CRM.Models;
@@ -35,9 +35,9 @@ namespace PROWESS_CRM.Controllers
             }
 
             var result = await _authService.AuthenticateAsync(request);
-            if (result == null)
+            if (result == null || !result.Success)
             {
-                return Unauthorized(new { message = "Invalid username/email or password." });
+                return Unauthorized(new { message = result?.Message ?? "Invalid username/email or password." });
             }
 
             return Ok(result);

@@ -1,4 +1,4 @@
-﻿//using Microsoft.AspNetCore.Mvc;
+//using Microsoft.AspNetCore.Mvc;
 //using PROWESS_CRM.Data;
 //using PROWESS_CRM.Models;
 
@@ -159,10 +159,19 @@ namespace PROWESS_CRM.Controllers
 
             try
             {
-                var existing = await _userRepository.GetByUsernameOrEmailAsync(user.Username);
-                if (existing != null)
+                var existingUsername = await _userRepository.GetByUsernameOrEmailAsync(user.Username);
+                if (existingUsername != null)
                 {
                     return BadRequest(ApiResponse<UserMaster>.FailureResponse($"User with username '{user.Username}' already exists."));
+                }
+
+                if (!string.IsNullOrWhiteSpace(user.Email))
+                {
+                    var existingEmail = await _userRepository.GetByUsernameOrEmailAsync(user.Email);
+                    if (existingEmail != null)
+                    {
+                        return BadRequest(ApiResponse<UserMaster>.FailureResponse($"User with email '{user.Email}' already exists. Please use a unique email address."));
+                    }
                 }
 
                 var createdUser = await _userRepository.CreateUserAsync(user);
@@ -171,8 +180,11 @@ namespace PROWESS_CRM.Controllers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error creating user {Username}", user.Username);
+                string errDetail = ex.Message.Contains("Violation of UNIQUE KEY") || ex.Message.Contains("duplicate key")
+                    ? "A user with this username or email already exists in the system."
+                    : ex.Message;
                 return StatusCode(StatusCodes.Status500InternalServerError,
-                    ApiResponse<UserMaster>.FailureResponse("An internal error occurred while creating the user."));
+                    ApiResponse<UserMaster>.FailureResponse($"Failed to create user: {errDetail}"));
             }
         }
 
@@ -203,8 +215,11 @@ namespace PROWESS_CRM.Controllers
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error updating user ID {UserId}", user.UserId);
+                string errDetail = ex.Message.Contains("Violation of UNIQUE KEY") || ex.Message.Contains("duplicate key")
+                    ? "A user with this username or email already exists in the system."
+                    : ex.Message;
                 return StatusCode(StatusCodes.Status500InternalServerError,
-                    ApiResponse<UserMaster>.FailureResponse("An internal error occurred while updating the user."));
+                    ApiResponse<UserMaster>.FailureResponse($"Failed to update user: {errDetail}"));
             }
         }
     }
