@@ -29,16 +29,16 @@ namespace PROWESS_CRM.Data
             cmd.CommandText = @"
                 SELECT 
                     MenuId,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuLabel') IS NOT NULL THEN MenuLabel ELSE Title END AS Title,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuPath') IS NOT NULL THEN MenuPath ELSE Route END AS Route,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuIcon') IS NOT NULL THEN MenuIcon ELSE IconName END AS IconName,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'ParentMenuId') IS NOT NULL THEN ParentMenuId ELSE ParentId END AS ParentId,
+                    MenuLabel AS Title,
+                    MenuPath AS Route,
+                    MenuIcon AS IconName,
+                    ParentMenuId AS ParentId,
                     SortOrder,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'AllowedRoles') IS NOT NULL THEN AllowedRoles ELSE Roles END AS Roles,
+                    AllowedRoles AS Roles,
                     IsActive,
                     'Main' AS Category,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Product_Code') IS NOT NULL THEN Product_Code ELSE NULL END AS Product_Code,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Is_Common') IS NOT NULL THEN Is_Common ELSE CAST(0 AS BIT) END AS Is_Common
+                    Product_Code,
+                    Is_Common
                 FROM dbo.MenuMaster
                 WHERE IsActive = 1
                   AND (@RoleName IS NULL OR AllowedRoles IS NULL OR AllowedRoles LIKE '%' + @RoleName + '%')
@@ -74,16 +74,16 @@ namespace PROWESS_CRM.Data
             cmd.CommandText = @"
                 SELECT 
                     MenuId,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuLabel') IS NOT NULL THEN MenuLabel ELSE Title END AS Title,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuPath') IS NOT NULL THEN MenuPath ELSE Route END AS Route,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'MenuIcon') IS NOT NULL THEN MenuIcon ELSE IconName END AS IconName,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'ParentMenuId') IS NOT NULL THEN ParentMenuId ELSE ParentId END AS ParentId,
+                    MenuLabel AS Title,
+                    MenuPath AS Route,
+                    MenuIcon AS IconName,
+                    ParentMenuId AS ParentId,
                     SortOrder,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'AllowedRoles') IS NOT NULL THEN AllowedRoles ELSE Roles END AS Roles,
+                    AllowedRoles AS Roles,
                     IsActive,
                     'Main' AS Category,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Product_Code') IS NOT NULL THEN Product_Code ELSE NULL END AS Product_Code,
-                    CASE WHEN COL_LENGTH('dbo.MenuMaster', 'Is_Common') IS NOT NULL THEN Is_Common ELSE CAST(0 AS BIT) END AS Is_Common
+                    Product_Code,
+                    Is_Common
                 FROM dbo.MenuMaster
                 WHERE IsActive = 1
                 ORDER BY SortOrder ASC;";
