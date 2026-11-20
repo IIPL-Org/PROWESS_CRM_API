@@ -11,6 +11,9 @@ namespace PROWESS_CRM.Services
         Task<ProwessApiMasterDto> CreateApiAsync(SaveProwessApiRequest request, int userId, CancellationToken cancellationToken = default);
         Task<ProwessApiMasterDto?> UpdateApiAsync(int apiMasterId, SaveProwessApiRequest request, int userId, CancellationToken cancellationToken = default);
         Task<bool> DeleteApiAsync(int apiMasterId, int userId, CancellationToken cancellationToken = default);
+        Task<IEnumerable<client_master_dto>> get_client_master(CancellationToken cancellationToken = default);
+        Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default);
+        Task<bool> save_customer_mappings(int clientId, string? clientName, IEnumerable<api_customer_mapping_dto> mappings, int userId, CancellationToken cancellationToken = default);
     }
 
     public class ApiOnlyAccessService : IApiOnlyAccessService
@@ -50,6 +53,21 @@ namespace PROWESS_CRM.Services
         public async Task<bool> DeleteApiAsync(int apiMasterId, int userId, CancellationToken cancellationToken = default)
         {
             return await _apiOnlyAccessRepository.DeleteApiAsync(apiMasterId, userId, cancellationToken);
+        }
+
+        public async Task<IEnumerable<client_master_dto>> get_client_master(CancellationToken cancellationToken = default)
+        {
+            return await _apiOnlyAccessRepository.get_client_master(cancellationToken);
+        }
+
+        public async Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default)
+        {
+            return await _apiOnlyAccessRepository.get_customer_mappings(clientId, cancellationToken);
+        }
+
+        public async Task<bool> save_customer_mappings(int clientId, string? clientName, IEnumerable<api_customer_mapping_dto> mappings, int userId, CancellationToken cancellationToken = default)
+        {
+            return await _apiOnlyAccessRepository.save_customer_mappings(clientId, clientName, mappings, userId, cancellationToken);
         }
     }
 }
