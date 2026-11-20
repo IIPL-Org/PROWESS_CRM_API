@@ -81,8 +81,7 @@ secrets.json
 # Visual Studio user-specific project files
 *.csproj.user
 
-# ASP.NET
-appsettings.Development.json
+# ASP.NET appsettings.Development.json
 
 # Project generated folders
 Payroll_CRM_API.vs
