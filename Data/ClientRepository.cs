@@ -387,22 +387,33 @@ namespace PROWESS_CRM.Data
         public async Task SaveClientProwessModulesAsync(int clientId, List<int> moduleIds, CancellationToken cancellationToken = default)
         {
             using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction();
 
-            // First delete existing mappings
-            using var deleteCommand = new SqlCommand("DELETE FROM Client_Prowess_Modules WHERE Client_Id = @Client_Id", connection);
-            deleteCommand.Parameters.AddWithValue("@Client_Id", clientId);
-            await deleteCommand.ExecuteNonQueryAsync(cancellationToken);
-
-            // Insert new mappings
-            if (moduleIds != null && moduleIds.Any())
+            try
             {
-                foreach (var moduleId in moduleIds)
+                // First delete existing mappings
+                using var deleteCommand = new SqlCommand("DELETE FROM dbo.Prowess_Client_Modules WHERE Client_Id = @Client_Id", connection, transaction);
+                deleteCommand.Parameters.AddWithValue("@Client_Id", clientId);
+                await deleteCommand.ExecuteNonQueryAsync(cancellationToken);
+
+                // Insert new mappings
+                if (moduleIds != null && moduleIds.Any())
                 {
-                    using var insertCommand = new SqlCommand("INSERT INTO Client_Prowess_Modules (Client_Id, Module_Id) VALUES (@Client_Id, @Module_Id)", connection);
-                    insertCommand.Parameters.AddWithValue("@Client_Id", clientId);
-                    insertCommand.Parameters.AddWithValue("@Module_Id", moduleId);
-                    await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+                    foreach (var moduleId in moduleIds.Distinct())
+                    {
+                        using var insertCommand = new SqlCommand("INSERT INTO dbo.Prowess_Client_Modules (Client_Id, Module_Id, Created_Date) VALUES (@Client_Id, @Module_Id, GETDATE())", connection, transaction);
+                        insertCommand.Parameters.AddWithValue("@Client_Id", clientId);
+                        insertCommand.Parameters.AddWithValue("@Module_Id", moduleId);
+                        await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+                    }
                 }
+
+                await transaction.CommitAsync(cancellationToken);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                throw;
             }
         }
 
@@ -412,7 +423,7 @@ namespace PROWESS_CRM.Data
             try
             {
                 using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
-                using var command = new SqlCommand("SELECT Module_Id FROM Client_Prowess_Modules WHERE Client_Id = @Client_Id", connection);
+                using var command = new SqlCommand("SELECT Module_Id FROM dbo.Prowess_Client_Modules WHERE Client_Id = @Client_Id", connection);
                 command.Parameters.AddWithValue("@Client_Id", clientId);
 
                 using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -423,7 +434,7 @@ namespace PROWESS_CRM.Data
             }
             catch (SqlException ex) when (ex.Number == 208)
             {
-                // Table Client_Prowess_Modules does not exist yet (pending setup script execution)
+                // Table Prowess_Client_Modules does not exist yet (pending setup script execution)
                 return new List<int>();
             }
             return moduleIds;
@@ -435,7 +446,7 @@ namespace PROWESS_CRM.Data
             try
             {
                 using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
-                using var command = new SqlCommand("SELECT Client_Id, Module_Id FROM Client_Prowess_Modules", connection);
+                using var command = new SqlCommand("SELECT Client_Id, Module_Id FROM dbo.Prowess_Client_Modules", connection);
 
                 using var reader = await command.ExecuteReaderAsync(cancellationToken);
                 while (await reader.ReadAsync(cancellationToken))
@@ -452,11 +463,12 @@ namespace PROWESS_CRM.Data
             }
             catch (SqlException ex) when (ex.Number == 208)
             {
-                // Table Client_Prowess_Modules does not exist yet (pending setup script execution)
+                // Table Prowess_Client_Modules does not exist yet (pending setup script execution)
                 return new Dictionary<int, List<int>>();
             }
             return result;
         }
+
 
 
     }

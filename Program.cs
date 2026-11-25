@@ -114,6 +114,8 @@ builder.Services.AddScoped<IModuleService, ModuleService>();
 builder.Services.AddScoped<IESModuleService, ESModuleService>();
 builder.Services.AddScoped<IProwessModuleService, ProwessModuleService>();
 builder.Services.AddScoped<IApiOnlyAccessService, ApiOnlyAccessService>();
+builder.Services.AddScoped<IClientRegistrationService, ClientRegistrationService>();
+
 
 
 builder.Services.AddHttpClient();
