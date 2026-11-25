@@ -300,6 +300,8 @@ namespace PROWESS_CRM.Models
         public string? PinCode { get; set; }
         public string RegistrationStage { get; set; } = "DRAFT";
         public string IsActive { get; set; } = "Y";
+        public string? CreatedByName { get; set; }
+        public string? TechnicalSignOffByName { get; set; }
         public List<ClientContactDto> Contacts { get; set; } = new();
         public List<ClientBranchDto> Branches { get; set; } = new();
         public ClientCommercialDto? Commercial { get; set; }
@@ -512,6 +514,8 @@ namespace PROWESS_CRM.Models
         public string CustomerStatus { get; set; } = "Prospect";
         public string RegistrationStage { get; set; } = "DRAFT";
         public string IsActive { get; set; } = "Y";
+        public string? CreatedByName { get; set; }
+        public string? TechnicalSignOffByName { get; set; }
         public DateTime RegistrationDate { get; set; }
         public DateTime? CreatedDate { get; set; }
         public DateTime? ModifiedDate { get; set; }

@@ -860,14 +860,18 @@ namespace PROWESS_CRM.Services
             ClientRegistrationResponseDto? result = null;
 
             const string masterSql = @"
-                SELECT Client_Id, Client_Name, Client_Address, Is_Active,
-                       Customer_Code, Display_Name, Customer_Type, Website, Year_Of_Establishment,
-                       Industry_Category, Business_Segment, Company_Size, Number_Of_Branches,
-                       Customer_Source, Relationship_Manager_Id, Customer_Status, Registration_Date, Internal_Remarks,
-                       PAN_No, GST_Registration_Type, GSTIN_Primary, CIN_No, LLPIN_No, TAN_No, MSME_Reg_No, IEC_No,
-                       Billing_Address, Country, State, City, District, PIN_Code, Registration_Stage
-                FROM dbo.Client_Master
-                WHERE Client_Id = @ClientId;";
+               SELECT m.Client_Id, m.Client_Name, m.Client_Address, m.Is_Active,
+                       m.Customer_Code, m.Display_Name, m.Customer_Type, m.Website, m.Year_Of_Establishment,
+                       m.Industry_Category, m.Business_Segment, m.Company_Size, m.Number_Of_Branches,
+                       m.Customer_Source, m.Relationship_Manager_Id, m.Customer_Status, m.Registration_Date, m.Internal_Remarks,
+                       m.PAN_No, m.GST_Registration_Type, m.GSTIN_Primary, m.CIN_No, m.LLPIN_No, m.TAN_No, m.MSME_Reg_No, m.IEC_No,
+                       m.Billing_Address, m.Country, m.State, m.City, m.District, m.PIN_Code, m.Registration_Stage,
+                       ISNULL(NULLIF(LTRIM(RTRIM(cu.FullName)), ''), cu.Username) AS CreatedByName,
+                       ISNULL(NULLIF(LTRIM(RTRIM(tu.FullName)), ''), tu.Username) AS TechnicalSignOffByName
+                FROM dbo.Client_Master m
+                LEFT JOIN dbo.UserMaster cu ON COALESCE(m.Admin_Submitted_By, m.Created_By) = cu.UserId
+                LEFT JOIN dbo.UserMaster tu ON m.Tech_Submitted_By = tu.UserId
+                WHERE m.Client_Id = @ClientId;";
 
             using (var cmd = new SqlCommand(masterSql, conn))
             {
@@ -876,6 +880,8 @@ namespace PROWESS_CRM.Services
                 if (await r.ReadAsync(cancellationToken))
                 {
                     result = MapMasterRow(r);
+                    result.CreatedByName = r["CreatedByName"] as string;
+                    result.TechnicalSignOffByName = r["TechnicalSignOffByName"] as string;
                 }
             }
 
@@ -1131,11 +1137,14 @@ namespace PROWESS_CRM.Services
                 const string thSql = @"
                     IF OBJECT_ID('dbo.Client_Technical_History', 'U') IS NOT NULL
                     BEGIN
-                        SELECT History_Id, Client_Id, Product_Code, Version_Label, Field_Name,
-                               Previous_Value, New_Value, Change_Reason, Created_By, Created_Date
-                        FROM dbo.Client_Technical_History
-                        WHERE Client_Id = @ClientId
-                        ORDER BY History_Id DESC;
+                         SELECT h.History_Id, h.Client_Id, h.Product_Code, h.Version_Label, h.Field_Name,
+                               h.Previous_Value, h.New_Value, h.Change_Reason,
+                               COALESCE(NULLIF(LTRIM(RTRIM(u.FullName)), ''), u.Username, h.Created_By) AS Created_By,
+                               h.Created_Date
+                        FROM dbo.Client_Technical_History h
+                        LEFT JOIN dbo.UserMaster u ON TRY_CAST(h.Created_By AS INT) = u.UserId
+                        WHERE h.Client_Id = @ClientId
+                        ORDER BY h.History_Id DESC;
                     END";
 
                 using var thCmd = new SqlCommand(thSql, conn);
