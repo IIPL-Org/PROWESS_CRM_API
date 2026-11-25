@@ -11,19 +11,31 @@ namespace PROWESS_CRM.Services
         Task<ClientRegistrationResponseDto> SaveClientRegistrationAsync(ClientRegistrationRequestDto dto, CancellationToken cancellationToken = default);
         Task<ClientRegistrationResponseDto?> GetClientRegistrationByIdAsync(int clientId, CancellationToken cancellationToken = default);
         Task<IEnumerable<ClientRegistrationResponseDto>> GetAllClientRegistrationsAsync(CancellationToken cancellationToken = default);
+        Task<IEnumerable<ClientSearchRowDto>> SearchClientsAsync(ClientSearchFilterDto? filter = null, CancellationToken cancellationToken = default);
         Task<IEnumerable<ClientDropdownOptionDto>> GetDropdownOptionsAsync(string mode, CancellationToken cancellationToken = default);
         Task<string> GenerateUniqueCustomerCodeAsync(string clientName, string? customerType = null, CancellationToken cancellationToken = default);
+        Task<bool> AdvanceActivationStepAsync(AdvanceActivationStepDto dto, CancellationToken cancellationToken = default);
+        Task<bool> UpdateTechnicalConfigAsync(UpdateTechnicalConfigDto dto, CancellationToken cancellationToken = default);
+        Task<ClientDocumentDto> UploadDocumentAsync(UploadClientDocumentDto dto, int actorUserId = 0, CancellationToken cancellationToken = default);
+        Task<IEnumerable<ClientDocumentDto>> GetDocumentsByClientIdAsync(int clientId, CancellationToken cancellationToken = default);
+        Task<(byte[] FileBytes, string ContentType, string DownloadFileName)?> GetDocumentFileAsync(int documentId, CancellationToken cancellationToken = default);
+        Task<bool> DeleteDocumentAsync(int documentId, int actorUserId = 1, CancellationToken cancellationToken = default);
     }
 
     public class ClientRegistrationService : IClientRegistrationService
     {
         private readonly IDbConnectionFactory _connectionFactory;
         private readonly ILogger<ClientRegistrationService> _logger;
+        private readonly string _baseStoragePath;
 
-        public ClientRegistrationService(IDbConnectionFactory connectionFactory, ILogger<ClientRegistrationService> logger)
+        public ClientRegistrationService(
+            IDbConnectionFactory connectionFactory,
+            ILogger<ClientRegistrationService> logger,
+            IConfiguration configuration)
         {
             _connectionFactory = connectionFactory;
             _logger = logger;
+            _baseStoragePath = configuration["DocumentStorage:BasePath"] ?? @"C:\ProwessCRM\Uploads\ClientDocuments";
         }
 
         private static string NormalizeYN(string? val, string defaultVal = "N")
@@ -47,8 +59,8 @@ namespace PROWESS_CRM.Services
         private static object DbStr(string? val) => string.IsNullOrWhiteSpace(val) ? DBNull.Value : val.Trim();
 
         public async Task<ClientRegistrationResponseDto> SaveClientRegistrationAsync(
-             ClientRegistrationRequestDto dto,
-             CancellationToken cancellationToken = default)
+            ClientRegistrationRequestDto dto,
+            CancellationToken cancellationToken = default)
         {
             using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
             using var transaction = (SqlTransaction)await conn.BeginTransactionAsync(cancellationToken);
@@ -57,10 +69,12 @@ namespace PROWESS_CRM.Services
             {
                 int clientId = dto.ClientId.GetValueOrDefault(0);
                 bool isNew = clientId <= 0;
-                int actorUserId = dto.CreatedBy > 0 ? dto.CreatedBy : 1;
+                if (dto.CreatedBy <= 0)
+                {
+                    throw new ArgumentException("CreatedBy user ID is required and must be greater than 0.");
+                }
+                int actorUserId = dto.CreatedBy;
                 string isActive = NormalizeYN(dto.IsActive, "Y");
-                //string stage = string.IsNullOrWhiteSpace(dto.RegistrationStage) ? "DRAFT" : dto.RegistrationStage.Trim().ToUpperInvariant();
-                //bool isAdminSubmitted = stage == "REGISTERED" || stage == "SUBMITTED" || stage == "ADMIN_SUBMITTED";
 
                 // Enforce exact CK_Client_Master_Stage values: ('DRAFT', 'PENDING_TECH', 'COMPLETED')
                 string rawStage = string.IsNullOrWhiteSpace(dto.RegistrationStage) ? "DRAFT" : dto.RegistrationStage.Trim().ToUpperInvariant();
@@ -195,7 +209,7 @@ namespace PROWESS_CRM.Services
                             Registration_Stage      = @RegistrationStage,
                             Admin_Submitted_By      = COALESCE(@AdminSubmittedBy, Admin_Submitted_By),
                             Admin_Submitted_Date    = COALESCE(@AdminSubmittedDate, Admin_Submitted_Date),
-                             Tech_Submitted_By       = CASE WHEN @RegistrationStage = 'COMPLETED' THEN @CreatedBy ELSE Tech_Submitted_By END,
+                            Tech_Submitted_By       = CASE WHEN @RegistrationStage = 'COMPLETED' THEN @CreatedBy ELSE Tech_Submitted_By END,
                             Tech_Submitted_Date     = CASE WHEN @RegistrationStage = 'COMPLETED' THEN GETDATE() ELSE Tech_Submitted_Date END,
                             Modified_By             = @CreatedBy,
                             Modified_Date           = GETDATE()
@@ -447,7 +461,296 @@ namespace PROWESS_CRM.Services
                 }
 
                 // =========================================================================
-                // 5. COMMIT TRANSACTION (All 4 tables succeeded)
+                // 5. SAVE TO dbo.Client_Technical_Config (1 : many, per Product_Code)
+                // =========================================================================
+                if (dto.TechnicalConfigs != null && dto.TechnicalConfigs.Any())
+                {
+                    const string upsertTechSql = @"
+                        IF EXISTS (SELECT 1 FROM dbo.Client_Technical_Config WHERE Client_Id = @ClientId AND Product_Code = @ProductCode)
+                        BEGIN
+                            UPDATE dbo.Client_Technical_Config
+                            SET Deployment_Type   = @DeploymentType,
+                                SQL_Version       = @SqlVersion,
+                                Server_Host       = @ServerHost,
+                                Port              = @Port,
+                                Database_Name     = @DatabaseName,
+                                DB_User           = @DbUser,
+                                DB_Password       = @DbPassword,
+                                Connection_String = @ConnectionString,
+                                Published_App_Url = @PublishedAppUrl,
+                                Api_Url           = @ApiUrl,
+                                Is_Active         = @IsActive,
+                                Technical_Remarks = @TechnicalRemarks,
+                                Modified_By       = @CreatedBy,
+                                Modified_Date     = GETDATE()
+                            WHERE Client_Id = @ClientId AND Product_Code = @ProductCode;
+                        END
+                        ELSE
+                        BEGIN
+                            INSERT INTO dbo.Client_Technical_Config (
+                                Client_Id, Product_Code, Deployment_Type, SQL_Version,
+                                Server_Host, Port, Database_Name, DB_User, DB_Password,
+                                Connection_String, Published_App_Url, Api_Url,
+                                Is_Active, Technical_Remarks, Created_By, Created_Date
+                            )
+                            VALUES (
+                                @ClientId, @ProductCode, @DeploymentType, @SqlVersion,
+                                @ServerHost, @Port, @DatabaseName, @DbUser, @DbPassword,
+                                @ConnectionString, @PublishedAppUrl, @ApiUrl,
+                                @IsActive, @TechnicalRemarks, @CreatedBy, GETDATE()
+                            );
+                        END";
+
+                    foreach (var tc in dto.TechnicalConfigs)
+                    {
+                        if (string.IsNullOrWhiteSpace(tc.ProductCode)) continue;
+
+                        string prodCode = tc.ProductCode.Trim().ToUpperInvariant();
+                        string deploy = string.IsNullOrWhiteSpace(tc.DeploymentType) ? "Cloud" : tc.DeploymentType.Trim();
+                        // Constraint CK_Client_Tech_Deploy CHECK (Deployment_Type IN ('Cloud', 'Standalone'))
+                        if (deploy != "Standalone") deploy = "Cloud";
+
+                        string techActive = NormalizeYN(tc.IsActive, "Y");
+                        string dbName = string.IsNullOrWhiteSpace(tc.DatabaseName) ? $"DB_{customerCode}_{prodCode}" : tc.DatabaseName.Trim();
+
+                        using var techCmd = new SqlCommand(upsertTechSql, conn, transaction);
+                        techCmd.Parameters.AddWithValue("@ClientId", clientId);
+                        techCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                        techCmd.Parameters.AddWithValue("@DeploymentType", deploy);
+                        techCmd.Parameters.AddWithValue("@SqlVersion", DbStr(tc.SqlVersion) ?? (object)"SQL Server 2022");
+                        techCmd.Parameters.AddWithValue("@ServerHost", DbStr(tc.ServerHost));
+                        techCmd.Parameters.AddWithValue("@Port", DbVal(tc.Port ?? 1433));
+                        techCmd.Parameters.AddWithValue("@DatabaseName", dbName);
+                        techCmd.Parameters.AddWithValue("@DbUser", DbStr(tc.DbUser));
+                        techCmd.Parameters.AddWithValue("@DbPassword", DbStr(tc.DbPassword));
+                        techCmd.Parameters.AddWithValue("@ConnectionString", DbStr(tc.ConnectionString));
+                        techCmd.Parameters.AddWithValue("@PublishedAppUrl", DbStr(tc.PublishedAppUrl));
+                        techCmd.Parameters.AddWithValue("@ApiUrl", DbStr(tc.ApiUrl));
+                        techCmd.Parameters.AddWithValue("@IsActive", techActive);
+                        techCmd.Parameters.AddWithValue("@TechnicalRemarks", DbStr(tc.TechnicalRemarks));
+                        techCmd.Parameters.AddWithValue("@CreatedBy", actorUserId);
+
+                        await techCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                }
+
+                // =========================================================================
+                // 6. SAVE TO dbo.Client_Subscription (1 : many, per Product_Code)
+                // =========================================================================
+                if (dto.Subscriptions != null && dto.Subscriptions.Any())
+                {
+                    const string upsertSubSql = @"
+                        IF EXISTS (SELECT 1 FROM dbo.Client_Subscription WHERE Client_Id = @ClientId AND Product_Code = @ProductCode)
+                        BEGIN
+                            UPDATE dbo.Client_Subscription
+                            SET Subscription_Type    = @SubscriptionType,
+                                Edition              = @Edition,
+                                License_Type         = @LicenseType,
+                                Licensed_Users       = @LicensedUsers,
+                                Active_Users         = @ActiveUsers,
+                                Start_Date           = @StartDate,
+                                End_Date             = @EndDate,
+                                Renewal_Date         = @RenewalDate,
+                                Subscription_Status  = @SubscriptionStatus,
+                                Branch_Limit         = @BranchLimit,
+                                Db_Limit             = @DbLimit,
+                                Tech_Owner           = @TechOwner,
+                                Commercial_Owner     = @CommercialOwner,
+                                Subscription_Remarks = @SubscriptionRemarks,
+                                Is_Active            = @IsActive,
+                                Modified_By          = @CreatedBy,
+                                Modified_Date        = GETDATE()
+                            WHERE Client_Id = @ClientId AND Product_Code = @ProductCode;
+                        END
+                        ELSE
+                        BEGIN
+                            INSERT INTO dbo.Client_Subscription (
+                                Client_Id, Product_Code, Subscription_Type, Edition,
+                                License_Type, Licensed_Users, Active_Users,
+                                Start_Date, End_Date, Renewal_Date,
+                                Subscription_Status, Branch_Limit, Db_Limit,
+                                Tech_Owner, Commercial_Owner, Subscription_Remarks,
+                                Is_Active, Created_By, Created_Date
+                            )
+                            VALUES (
+                                @ClientId, @ProductCode, @SubscriptionType, @Edition,
+                                @LicenseType, @LicensedUsers, @ActiveUsers,
+                                @StartDate, @EndDate, @RenewalDate,
+                                @SubscriptionStatus, @BranchLimit, @DbLimit,
+                                @TechOwner, @CommercialOwner, @SubscriptionRemarks,
+                                @IsActive, @CreatedBy, GETDATE()
+                            );
+                        END";
+
+                    foreach (var s in dto.Subscriptions)
+                    {
+                        if (string.IsNullOrWhiteSpace(s.ProductCode)) continue;
+
+                        string prodCode = s.ProductCode.Trim().ToUpperInvariant();
+                        string subType = string.IsNullOrWhiteSpace(s.SubscriptionType) ? "Annual" : s.SubscriptionType.Trim();
+                        string edition = string.IsNullOrWhiteSpace(s.Edition) ? "Standard" : s.Edition.Trim();
+                        string subStatus = string.IsNullOrWhiteSpace(s.SubscriptionStatus) ? "Pending Approval" : s.SubscriptionStatus.Trim();
+                        string subActive = NormalizeYN(s.IsActive, "Y");
+
+                        using var subCmd = new SqlCommand(upsertSubSql, conn, transaction);
+                        subCmd.Parameters.AddWithValue("@ClientId", clientId);
+                        subCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                        subCmd.Parameters.AddWithValue("@SubscriptionType", subType);
+                        subCmd.Parameters.AddWithValue("@Edition", edition);
+                        subCmd.Parameters.AddWithValue("@LicenseType", DbStr(s.LicenseType) ?? (object)"Named user");
+                        subCmd.Parameters.AddWithValue("@LicensedUsers", s.LicensedUsers > 0 ? s.LicensedUsers : 1);
+                        subCmd.Parameters.AddWithValue("@ActiveUsers", s.ActiveUsers >= 0 ? s.ActiveUsers : 0);
+                        subCmd.Parameters.AddWithValue("@StartDate", DbVal(s.StartDate ?? DateTime.Today));
+                        subCmd.Parameters.AddWithValue("@EndDate", DbVal(s.EndDate));
+                        subCmd.Parameters.AddWithValue("@RenewalDate", DbVal(s.RenewalDate));
+                        subCmd.Parameters.AddWithValue("@SubscriptionStatus", subStatus);
+                        subCmd.Parameters.AddWithValue("@BranchLimit", DbVal(s.BranchLimit ?? 1));
+                        subCmd.Parameters.AddWithValue("@DbLimit", DbVal(s.DbLimit ?? 1));
+                        subCmd.Parameters.AddWithValue("@TechOwner", DbStr(s.TechOwner));
+                        subCmd.Parameters.AddWithValue("@CommercialOwner", DbStr(s.CommercialOwner));
+                        subCmd.Parameters.AddWithValue("@SubscriptionRemarks", DbStr(s.SubscriptionRemarks));
+                        subCmd.Parameters.AddWithValue("@IsActive", subActive);
+                        subCmd.Parameters.AddWithValue("@CreatedBy", actorUserId);
+
+                        await subCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                }
+
+                // =========================================================================
+                // 7. SAVE TO dbo.Client_Product_Activation (Initializes or updates Activation per product)
+                // =========================================================================
+                if (dto.Subscriptions != null && dto.Subscriptions.Any())
+                {
+                    const string initActSql = @"
+                        IF NOT EXISTS (SELECT 1 FROM dbo.Client_Product_Activation WHERE Client_Id = @ClientId AND Product_Code = @ProductCode)
+                        BEGIN
+                            INSERT INTO dbo.Client_Product_Activation (
+                                Client_Id, Product_Code, Current_Step_No, Activation_Status,
+                                Is_On_Hold, Tech_Owner, Created_By, Created_Date
+                            )
+                            VALUES (
+                                @ClientId, @ProductCode, 1, 'In Progress',
+                                'N', @TechOwner, @CreatedBy, GETDATE()
+                            );
+
+                            DECLARE @NewActId int = SCOPE_IDENTITY();
+                            INSERT INTO dbo.Client_Activation_Step_History (
+                                Activation_Id, Step_No, Step_Name, Status,
+                                Completed_Date, Completed_By_User, User_Role, Remarks
+                            )
+                            VALUES (
+                                @NewActId, 1, 'Customer Registration', 'Completed',
+                                GETDATE(), 'System', 'Admin', 'Customer registered and initial activation tracker created'
+                            );
+                        END;";
+
+                    foreach (var s in dto.Subscriptions)
+                    {
+                        if (string.IsNullOrWhiteSpace(s.ProductCode)) continue;
+                        string prodCode = s.ProductCode.Trim().ToUpperInvariant();
+
+                        using var initActCmd = new SqlCommand(initActSql, conn, transaction);
+                        initActCmd.Parameters.AddWithValue("@ClientId", clientId);
+                        initActCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                        initActCmd.Parameters.AddWithValue("@TechOwner", DbStr(s.TechOwner));
+                        initActCmd.Parameters.AddWithValue("@CreatedBy", actorUserId);
+
+                        await initActCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                }
+
+                // =========================================================================
+                // 7. SAVE TO dbo.Client_Technical_History (Version Audit History)
+                // =========================================================================
+                if (dto.TechnicalHistories != null && dto.TechnicalHistories.Any())
+                {
+                    const string insertHistSql = @"
+                        IF OBJECT_ID('dbo.Client_Technical_History', 'U') IS NOT NULL
+                        BEGIN
+                            IF NOT EXISTS (SELECT 1 FROM dbo.Client_Technical_History 
+                                           WHERE Client_Id = @ClientId 
+                                             AND Product_Code = @ProductCode 
+                                             AND Version_Label = @VersionLabel 
+                                             AND Field_Name = @FieldName)
+                            BEGIN
+                                INSERT INTO dbo.Client_Technical_History (
+                                    Client_Id, Product_Code, Version_Label, Field_Name,
+                                    Previous_Value, New_Value, Change_Reason, Created_By, Created_Date
+                                )
+                                VALUES (
+                                    @ClientId, @ProductCode, @VersionLabel, @FieldName,
+                                    @PreviousValue, @NewValue, @ChangeReason, @CreatedBy, @CreatedDate
+                                );
+                            END
+                        END";
+
+                    foreach (var h in dto.TechnicalHistories)
+                    {
+                        if (string.IsNullOrWhiteSpace(h.FieldName)) continue;
+                        using var hCmd = new SqlCommand(insertHistSql, conn, transaction);
+                        hCmd.Parameters.AddWithValue("@ClientId", clientId);
+                        hCmd.Parameters.AddWithValue("@ProductCode", string.IsNullOrWhiteSpace(h.ProductCode) ? "ERP" : h.ProductCode.Trim().ToUpperInvariant());
+                        hCmd.Parameters.AddWithValue("@VersionLabel", string.IsNullOrWhiteSpace(h.VersionLabel) ? "v1" : h.VersionLabel.Trim());
+                        hCmd.Parameters.AddWithValue("@FieldName", h.FieldName.Trim());
+                        hCmd.Parameters.AddWithValue("@PreviousValue", DbStr(h.PreviousValue));
+                        hCmd.Parameters.AddWithValue("@NewValue", DbStr(h.NewValue));
+                        hCmd.Parameters.AddWithValue("@ChangeReason", DbStr(h.ChangeReason));
+                        hCmd.Parameters.AddWithValue("@CreatedBy", DbStr(h.CreatedBy) ?? (object)actorUserId);
+                        hCmd.Parameters.AddWithValue("@CreatedDate", h.CreatedDate ?? DateTime.Now);
+
+                        await hCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                }
+
+                // =========================================================================
+                // 8. SAVE TO dbo.Client_Audit_Log
+                // =========================================================================
+                if (dto.AuditLogs != null && dto.AuditLogs.Any())
+                {
+                    const string insertAuditSql = @"
+                        IF OBJECT_ID('dbo.Client_Audit_Log', 'U') IS NOT NULL
+                        BEGIN
+                            INSERT INTO dbo.Client_Audit_Log (
+                                Client_Id, Section_Name, Table_Name, Record_Id,
+                                Field_Name, Previous_Value, Updated_Value, Change_Reason,
+                                Changed_By, Changed_Date
+                            )
+                            VALUES (
+                                @ClientId, @SectionName, @TableName, @RecordId,
+                                @FieldName, @PreviousValue, @UpdatedValue, @ChangeReason,
+                                @ChangedBy, @ChangedDate
+                            );
+                        END";
+
+                    try
+                    {
+                        foreach (var a in dto.AuditLogs)
+                        {
+                            if (a.AuditId.HasValue && a.AuditId.Value > 0) continue;
+                            if (string.IsNullOrWhiteSpace(a.FieldName)) continue;
+                            using var aCmd = new SqlCommand(insertAuditSql, conn, transaction);
+                            aCmd.Parameters.AddWithValue("@ClientId", clientId);
+                            aCmd.Parameters.AddWithValue("@SectionName", string.IsNullOrWhiteSpace(a.SectionName) ? "Customer Profile" : a.SectionName.Trim());
+                            aCmd.Parameters.AddWithValue("@TableName", string.IsNullOrWhiteSpace(a.TableName) ? "Client_Master" : a.TableName.Trim());
+                            aCmd.Parameters.AddWithValue("@RecordId", DbVal(a.RecordId));
+                            aCmd.Parameters.AddWithValue("@FieldName", a.FieldName.Trim());
+                            aCmd.Parameters.AddWithValue("@PreviousValue", DbStr(a.PreviousValue));
+                            aCmd.Parameters.AddWithValue("@UpdatedValue", DbStr(a.UpdatedValue));
+                            aCmd.Parameters.AddWithValue("@ChangeReason", DbStr(a.ChangeReason));
+                            aCmd.Parameters.AddWithValue("@ChangedBy", a.ChangedBy > 0 ? a.ChangedBy : actorUserId);
+                            aCmd.Parameters.AddWithValue("@ChangedDate", a.ChangedDate ?? DateTime.Now);
+
+                            await aCmd.ExecuteNonQueryAsync(cancellationToken);
+                        }
+                    }
+                    catch (SqlException ex)
+                    {
+                        _logger.LogWarning(ex, "Could not save Client_Audit_Log (table may not exist yet in database).");
+                    }
+                }
+
+                // =========================================================================
+                // 9. COMMIT TRANSACTION (All tables succeeded)
                 // =========================================================================
                 await transaction.CommitAsync(cancellationToken);
                 _logger.LogInformation("Successfully saved Client Registration for Client_Id={ClientId}, Customer_Code={CustomerCode}", clientId, customerCode);
@@ -476,7 +779,6 @@ namespace PROWESS_CRM.Services
                 throw;
             }
         }
-
 
         private static void BindMasterParameters(
             SqlCommand cmd,
@@ -686,6 +988,277 @@ namespace PROWESS_CRM.Services
                 }
             }
 
+            // Load Technical Configs (dbo.Client_Technical_Config)
+            const string techSql = @"
+                SELECT Config_Id, Product_Code, Deployment_Type, SQL_Version, Server_Host,
+                       Port, Database_Name, DB_User, DB_Password, Connection_String,
+                       Published_App_Url, Api_Url, Is_Active, Technical_Remarks
+                FROM dbo.Client_Technical_Config
+                WHERE Client_Id = @ClientId
+                ORDER BY Config_Id ASC;";
+
+            using (var techCmd = new SqlCommand(techSql, conn))
+            {
+                techCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var tr = await techCmd.ExecuteReaderAsync(cancellationToken);
+                while (await tr.ReadAsync(cancellationToken))
+                {
+                    result.TechnicalConfigs.Add(new ClientTechnicalDto
+                    {
+                        ConfigId = Convert.ToInt32(tr["Config_Id"]),
+                        ProductCode = tr["Product_Code"]?.ToString()?.Trim() ?? "ERP",
+                        DeploymentType = tr["Deployment_Type"]?.ToString()?.Trim() ?? "Cloud",
+                        SqlVersion = tr["SQL_Version"] as string ?? "SQL Server 2022",
+                        ServerHost = tr["Server_Host"] as string,
+                        Port = tr["Port"] == DBNull.Value ? 1433 : Convert.ToInt32(tr["Port"]),
+                        DatabaseName = tr["Database_Name"]?.ToString() ?? string.Empty,
+                        DbUser = tr["DB_User"] as string,
+                        DbPassword = tr["DB_Password"] as string,
+                        ConnectionString = tr["Connection_String"] as string,
+                        PublishedAppUrl = tr["Published_App_Url"] as string,
+                        ApiUrl = tr["Api_Url"] as string,
+                        IsActive = tr["Is_Active"]?.ToString()?.Trim() ?? "Y",
+                        TechnicalRemarks = tr["Technical_Remarks"] as string
+                    });
+                }
+            }
+
+            // Load Subscriptions (dbo.Client_Subscription)
+            const string subSql = @"
+                SELECT Subscription_Id, Product_Code, Subscription_Type, Edition,
+                       License_Type, Licensed_Users, Active_Users, Start_Date,
+                       End_Date, Renewal_Date, Subscription_Status, Branch_Limit,
+                       Db_Limit, Tech_Owner, Commercial_Owner, Subscription_Remarks,
+                       Is_Active
+                FROM dbo.Client_Subscription
+                WHERE Client_Id = @ClientId
+                ORDER BY Subscription_Id ASC;";
+
+            using (var subCmd = new SqlCommand(subSql, conn))
+            {
+                subCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var sr = await subCmd.ExecuteReaderAsync(cancellationToken);
+                while (await sr.ReadAsync(cancellationToken))
+                {
+                    result.Subscriptions.Add(new ClientSubscriptionDto
+                    {
+                        SubscriptionId = Convert.ToInt32(sr["Subscription_Id"]),
+                        ProductCode = sr["Product_Code"]?.ToString()?.Trim() ?? "ERP",
+                        SubscriptionType = sr["Subscription_Type"]?.ToString()?.Trim() ?? "Annual",
+                        Edition = sr["Edition"]?.ToString()?.Trim() ?? "Standard",
+                        LicenseType = sr["License_Type"] as string ?? "Named user",
+                        LicensedUsers = sr["Licensed_Users"] == DBNull.Value ? 1 : Convert.ToInt32(sr["Licensed_Users"]),
+                        ActiveUsers = sr["Active_Users"] == DBNull.Value ? 0 : Convert.ToInt32(sr["Active_Users"]),
+                        StartDate = sr["Start_Date"] == DBNull.Value ? null : Convert.ToDateTime(sr["Start_Date"]),
+                        EndDate = sr["End_Date"] == DBNull.Value ? null : Convert.ToDateTime(sr["End_Date"]),
+                        RenewalDate = sr["Renewal_Date"] == DBNull.Value ? null : Convert.ToDateTime(sr["Renewal_Date"]),
+                        SubscriptionStatus = sr["Subscription_Status"]?.ToString()?.Trim() ?? "Pending Approval",
+                        BranchLimit = sr["Branch_Limit"] == DBNull.Value ? null : Convert.ToInt32(sr["Branch_Limit"]),
+                        DbLimit = sr["Db_Limit"] == DBNull.Value ? null : Convert.ToInt32(sr["Db_Limit"]),
+                        TechOwner = sr["Tech_Owner"] as string,
+                        CommercialOwner = sr["Commercial_Owner"] as string,
+                        SubscriptionRemarks = sr["Subscription_Remarks"] as string,
+                        IsActive = sr["Is_Active"]?.ToString()?.Trim() ?? "Y"
+                    });
+                }
+            }
+
+            // Load Activations & Step Histories (dbo.Client_Product_Activation)
+            const string actSql = @"
+                SELECT Activation_Id, Product_Code, Current_Step_No, Activation_Status,
+                       Is_On_Hold, Hold_Reason, Tech_Owner, Tech_Done_Date, Go_Live_Date
+                FROM dbo.Client_Product_Activation
+                WHERE Client_Id = @ClientId
+                ORDER BY Activation_Id ASC;";
+
+            using (var actCmd = new SqlCommand(actSql, conn))
+            {
+                actCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var ar = await actCmd.ExecuteReaderAsync(cancellationToken);
+                while (await ar.ReadAsync(cancellationToken))
+                {
+                    result.Activations.Add(new ClientActivationDto
+                    {
+                        ActivationId = Convert.ToInt32(ar["Activation_Id"]),
+                        ProductCode = ar["Product_Code"]?.ToString()?.Trim() ?? "ERP",
+                        CurrentStepNo = Convert.ToInt32(ar["Current_Step_No"]),
+                        ActivationStatus = ar["Activation_Status"]?.ToString()?.Trim() ?? "In Progress",
+                        IsOnHold = ar["Is_On_Hold"]?.ToString()?.Trim() ?? "N",
+                        HoldReason = ar["Hold_Reason"] as string,
+                        TechOwner = ar["Tech_Owner"] as string,
+                        TechDoneDate = ar["Tech_Done_Date"] == DBNull.Value ? null : Convert.ToDateTime(ar["Tech_Done_Date"]),
+                        GoLiveDate = ar["Go_Live_Date"] == DBNull.Value ? null : Convert.ToDateTime(ar["Go_Live_Date"])
+                    });
+                }
+            }
+
+            // For each activation, load step history
+            foreach (var actItem in result.Activations)
+            {
+                if (actItem.ActivationId.HasValue)
+                {
+                    const string histSql = @"
+                        SELECT Step_History_Id, Activation_Id, Step_No, Step_Name,
+                               Status, Completed_Date, Completed_By_User, User_Role, Remarks
+                        FROM dbo.Client_Activation_Step_History
+                        WHERE Activation_Id = @ActivationId
+                        ORDER BY Step_No ASC, Step_History_Id ASC;";
+
+                    using var hCmd = new SqlCommand(histSql, conn);
+                    hCmd.Parameters.AddWithValue("@ActivationId", actItem.ActivationId.Value);
+                    using var hr = await hCmd.ExecuteReaderAsync(cancellationToken);
+                    while (await hr.ReadAsync(cancellationToken))
+                    {
+                        actItem.StepHistory.Add(new ClientActivationStepHistoryDto
+                        {
+                            StepHistoryId = Convert.ToInt32(hr["Step_History_Id"]),
+                            ActivationId = Convert.ToInt32(hr["Activation_Id"]),
+                            StepNo = Convert.ToInt32(hr["Step_No"]),
+                            StepName = hr["Step_Name"]?.ToString() ?? string.Empty,
+                            Status = hr["Status"]?.ToString()?.Trim() ?? "Completed",
+                            CompletedDate = Convert.ToDateTime(hr["Completed_Date"]),
+                            CompletedByUser = hr["Completed_By_User"]?.ToString() ?? string.Empty,
+                            UserRole = hr["User_Role"] as string,
+                            Remarks = hr["Remarks"] as string
+                        });
+                    }
+                }
+            }
+
+            // Load Technical History (dbo.Client_Technical_History)
+            try
+            {
+                const string thSql = @"
+                    IF OBJECT_ID('dbo.Client_Technical_History', 'U') IS NOT NULL
+                    BEGIN
+                        SELECT History_Id, Client_Id, Product_Code, Version_Label, Field_Name,
+                               Previous_Value, New_Value, Change_Reason, Created_By, Created_Date
+                        FROM dbo.Client_Technical_History
+                        WHERE Client_Id = @ClientId
+                        ORDER BY History_Id DESC;
+                    END";
+
+                using var thCmd = new SqlCommand(thSql, conn);
+                thCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var thr = await thCmd.ExecuteReaderAsync(cancellationToken);
+                while (await thr.ReadAsync(cancellationToken))
+                {
+                    result.TechnicalHistories.Add(new ClientTechnicalHistoryDto
+                    {
+                        HistoryId = Convert.ToInt32(thr["History_Id"]),
+                        ClientId = Convert.ToInt32(thr["Client_Id"]),
+                        ProductCode = thr["Product_Code"]?.ToString()?.Trim() ?? "ERP",
+                        VersionLabel = thr["Version_Label"]?.ToString()?.Trim() ?? "v1",
+                        FieldName = thr["Field_Name"]?.ToString() ?? string.Empty,
+                        PreviousValue = thr["Previous_Value"] as string,
+                        NewValue = thr["New_Value"] as string,
+                        ChangeReason = thr["Change_Reason"] as string,
+                        CreatedBy = thr["Created_By"] as string,
+                        CreatedDate = thr["Created_Date"] == DBNull.Value ? null : Convert.ToDateTime(thr["Created_Date"])
+                    });
+                }
+            }
+            catch (SqlException ex)
+            {
+                _logger.LogWarning(ex, "Could not load Client_Technical_History (table may not exist yet in database).");
+            }
+
+            // Load Documents (dbo.Client_Document)
+            try
+            {
+                const string docSql = @"
+                    IF OBJECT_ID('dbo.Client_Document', 'U') IS NOT NULL
+                    BEGIN
+                        SELECT d.Document_Id, d.Client_Id, d.Document_Name, d.Original_File_Name,
+                               d.Stored_File_Name, d.File_Path, d.File_Extension, d.File_Size_Bytes,
+                               d.Content_Type, d.Document_Category, d.Document_Version, d.Expiry_Date,
+                               d.Access_Level, d.Is_Active, d.Created_By, d.Created_Date,
+                               u.FullName AS CreatedByName
+                        FROM dbo.Client_Document d
+                        LEFT JOIN dbo.UserMaster u ON d.Created_By = u.UserId
+                        WHERE d.Client_Id = @ClientId AND d.Is_Active = 'Y'
+                        ORDER BY d.Document_Id DESC;
+                    END";
+
+                using var docCmd = new SqlCommand(docSql, conn);
+                docCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var dr = await docCmd.ExecuteReaderAsync(cancellationToken);
+                while (await dr.ReadAsync(cancellationToken))
+                {
+                    result.Documents.Add(new ClientDocumentDto
+                    {
+                        DocumentId = Convert.ToInt32(dr["Document_Id"]),
+                        ClientId = Convert.ToInt32(dr["Client_Id"]),
+                        DocumentName = dr["Document_Name"]?.ToString() ?? string.Empty,
+                        OriginalFileName = dr["Original_File_Name"]?.ToString() ?? string.Empty,
+                        StoredFileName = dr["Stored_File_Name"]?.ToString() ?? string.Empty,
+                        FilePath = dr["File_Path"]?.ToString() ?? string.Empty,
+                        FileExtension = dr["File_Extension"]?.ToString() ?? string.Empty,
+                        FileSizeBytes = dr["File_Size_Bytes"] == DBNull.Value ? null : Convert.ToInt64(dr["File_Size_Bytes"]),
+                        ContentType = dr["Content_Type"] as string,
+                        DocumentCategory = dr["Document_Category"]?.ToString() ?? "Other Documents",
+                        DocumentVersion = dr["Document_Version"]?.ToString() ?? "v1",
+                        ExpiryDate = dr["Expiry_Date"] == DBNull.Value ? null : Convert.ToDateTime(dr["Expiry_Date"]),
+                        AccessLevel = dr["Access_Level"]?.ToString() ?? "all",
+                        IsActive = dr["Is_Active"]?.ToString() ?? "Y",
+                        CreatedBy = Convert.ToInt32(dr["Created_By"]),
+                        CreatedByName = dr["CreatedByName"] as string,
+                        CreatedDate = Convert.ToDateTime(dr["Created_Date"])
+                    });
+                }
+            }
+
+            catch (SqlException ex)
+            {
+                _logger.LogWarning(ex, "Could not load Client_Document (table may not exist yet in database).");
+            }
+
+            // Load Audit Logs (dbo.Client_Audit_Log)
+            try
+            {
+                const string auditSql = @"
+                    IF OBJECT_ID('dbo.Client_Audit_Log', 'U') IS NOT NULL
+                    BEGIN
+                        SELECT a.Audit_Id, a.Client_Id, a.Section_Name, a.Table_Name, a.Record_Id,
+                               a.Field_Name, a.Previous_Value, a.Updated_Value, a.Change_Reason,
+                               a.Changed_By, a.Changed_Date,
+                               ISNULL(NULLIF(LTRIM(RTRIM(u.FullName)), ''), u.Username) AS ChangedByName,
+                               u.Role AS ChangedByRole
+                        FROM dbo.Client_Audit_Log a
+                        LEFT JOIN dbo.UserMaster u ON a.Changed_By = u.UserId
+                        WHERE a.Client_Id = @ClientId
+                        ORDER BY a.Audit_Id DESC;
+                    END";
+
+                using var aCmd = new SqlCommand(auditSql, conn);
+                aCmd.Parameters.AddWithValue("@ClientId", clientId);
+                using var ar = await aCmd.ExecuteReaderAsync(cancellationToken);
+                while (await ar.ReadAsync(cancellationToken))
+                {
+                    result.AuditLogs.Add(new ClientAuditLogDto
+                    {
+                        AuditId = Convert.ToInt64(ar["Audit_Id"]),
+                        ClientId = Convert.ToInt32(ar["Client_Id"]),
+                        SectionName = ar["Section_Name"]?.ToString() ?? "Customer Profile",
+                        TableName = ar["Table_Name"]?.ToString() ?? "Client_Master",
+                        RecordId = ar["Record_Id"] == DBNull.Value ? null : Convert.ToInt32(ar["Record_Id"]),
+                        FieldName = ar["Field_Name"]?.ToString() ?? string.Empty,
+                        PreviousValue = ar["Previous_Value"] as string,
+                        UpdatedValue = ar["Updated_Value"] as string,
+                        ChangeReason = ar["Change_Reason"] as string,
+                        ChangedBy = Convert.ToInt32(ar["Changed_By"]),
+                        ChangedByName = ar["ChangedByName"] as string,
+                        ChangedByRole = ar["ChangedByRole"] as string,
+                        ChangedDate = Convert.ToDateTime(ar["Changed_Date"])
+                    });
+                }
+            }
+            catch (SqlException ex)
+            {
+                _logger.LogWarning(ex, "Could not load Client_Audit_Log (table may not exist yet in database).");
+            }
+
+
             return result;
         }
 
@@ -709,6 +1282,135 @@ namespace PROWESS_CRM.Services
             while (await r.ReadAsync(cancellationToken))
             {
                 list.Add(MapMasterRow(r));
+            }
+
+            return list;
+        }
+
+        public async Task<IEnumerable<ClientSearchRowDto>> SearchClientsAsync(ClientSearchFilterDto? filter = null, CancellationToken cancellationToken = default)
+        {
+            var list = new List<ClientSearchRowDto>();
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+
+            var sql = @"
+                SELECT 
+                    m.Client_Id,
+                    m.Customer_Code,
+                    m.Client_Name,
+                    m.Display_Name,
+                    m.Customer_Type,
+                    m.Industry_Category,
+                    m.Business_Segment,
+                    m.City,
+                    m.State,
+                    m.Country,
+                    m.GSTIN_Primary,
+                    m.PAN_No,
+                    m.Customer_Status,
+                    m.Registration_Stage,
+                    m.Is_Active,
+                    m.Registration_Date,
+                    m.Created_Date,
+                    m.Modified_Date,
+                    ISNULL(br.BranchCount, 0) AS BranchCount,
+                    c.Contact_Name AS PrimaryContactName,
+                    c.Mobile_No AS PrimaryContactMobile,
+                    c.Email AS PrimaryContactEmail,
+                    c.Designation AS PrimaryContactDesignation
+                FROM dbo.Client_Master m
+                LEFT JOIN (
+                    SELECT 
+                        Client_Id, 
+                        Contact_Name, 
+                        Mobile_No, 
+                        Email, 
+                        Designation,
+                        ROW_NUMBER() OVER (PARTITION BY Client_Id ORDER BY CASE WHEN Is_Primary = 'Y' THEN 0 ELSE 1 END, Contact_Id ASC) AS rn
+                    FROM dbo.Client_Contact
+                    WHERE Is_Active = 'Y'
+                ) c ON m.Client_Id = c.Client_Id AND c.rn = 1
+                LEFT JOIN (
+                    SELECT Client_Id, COUNT(1) AS BranchCount
+                    FROM dbo.Client_Branch
+                    GROUP BY Client_Id
+                ) br ON m.Client_Id = br.Client_Id
+                WHERE 1=1 ";
+
+            using var cmd = new SqlCommand();
+            cmd.Connection = conn;
+
+            if (filter != null)
+            {
+                if (!string.IsNullOrWhiteSpace(filter.SearchQuery))
+                {
+                    sql += @" AND (
+                        m.Client_Name LIKE @Query 
+                        OR m.Customer_Code LIKE @Query 
+                        OR m.GSTIN_Primary LIKE @Query 
+                        OR m.PAN_No LIKE @Query
+                        OR c.Mobile_No LIKE @Query 
+                        OR c.Contact_Name LIKE @Query
+                    )";
+                    cmd.Parameters.AddWithValue("@Query", $"%{filter.SearchQuery.Trim()}%");
+                }
+
+                if (!string.IsNullOrWhiteSpace(filter.Industry))
+                {
+                    sql += " AND m.Industry_Category = @Industry";
+                    cmd.Parameters.AddWithValue("@Industry", filter.Industry.Trim());
+                }
+
+                if (!string.IsNullOrWhiteSpace(filter.State))
+                {
+                    sql += " AND m.State = @State";
+                    cmd.Parameters.AddWithValue("@State", filter.State.Trim());
+                }
+
+                if (!string.IsNullOrWhiteSpace(filter.Status))
+                {
+                    sql += " AND m.Customer_Status = @Status";
+                    cmd.Parameters.AddWithValue("@Status", filter.Status.Trim());
+                }
+
+                if (!string.IsNullOrWhiteSpace(filter.Stage))
+                {
+                    sql += " AND m.Registration_Stage = @Stage";
+                    cmd.Parameters.AddWithValue("@Stage", filter.Stage.Trim());
+                }
+            }
+
+            sql += " ORDER BY m.Client_Id DESC;";
+            cmd.CommandText = sql;
+
+            using var r = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await r.ReadAsync(cancellationToken))
+            {
+                list.Add(new ClientSearchRowDto
+                {
+                    ClientId = Convert.ToInt32(r["Client_Id"]),
+                    CustomerCode = r["Customer_Code"]?.ToString() ?? string.Empty,
+                    ClientName = r["Client_Name"]?.ToString() ?? string.Empty,
+                    DisplayName = r["Display_Name"] as string,
+                    CustomerType = r["Customer_Type"] as string,
+                    IndustryCategory = r["Industry_Category"] as string,
+                    BusinessSegment = r["Business_Segment"] as string,
+                    City = r["City"] as string,
+                    State = r["State"] as string,
+                    Country = r["Country"] as string ?? "India",
+                    PrimaryContactName = r["PrimaryContactName"] as string,
+                    PrimaryContactMobile = r["PrimaryContactMobile"] as string,
+                    PrimaryContactEmail = r["PrimaryContactEmail"] as string,
+                    PrimaryContactDesignation = r["PrimaryContactDesignation"] as string,
+                    GstinPrimary = r["GSTIN_Primary"] as string,
+                    PanNo = r["PAN_No"] as string,
+                    CustomerStatus = r["Customer_Status"]?.ToString() ?? "Prospect",
+                    RegistrationStage = r["Registration_Stage"]?.ToString() ?? "DRAFT",
+                    IsActive = r["Is_Active"]?.ToString() ?? "Y",
+                    RegistrationDate = r["Registration_Date"] != DBNull.Value ? Convert.ToDateTime(r["Registration_Date"]) : DateTime.Today,
+                    CreatedDate = r["Created_Date"] != DBNull.Value ? Convert.ToDateTime(r["Created_Date"]) : null,
+                    ModifiedDate = r["Modified_Date"] != DBNull.Value ? Convert.ToDateTime(r["Modified_Date"]) : null,
+                    BranchCount = r["BranchCount"] != DBNull.Value ? Convert.ToInt32(r["BranchCount"]) : 0
+                });
             }
 
             return list;
@@ -989,6 +1691,20 @@ namespace PROWESS_CRM.Services
                     WHERE IsActive = 1
                     ORDER BY Label;';
                 END
+                ELSE IF @m = 'USERS' OR @m = 'USER_MASTER'
+                BEGIN
+                    SET @sql = '
+                    SELECT 
+                        UserId AS Id,
+                        ''USERS'' AS Mode,
+                        Username AS Value,
+                        ISNULL(NULLIF(LTRIM(RTRIM(FullName)), ''''), Username) AS Label,
+                        CAST(LEFT(ISNULL(Role, ''User''), 20) AS VARCHAR(20)) AS ExtraCode,
+                        UserId AS SortOrder
+                    FROM dbo.UserMaster
+                    WHERE IsActive = 1
+                    ORDER BY UserId;';
+                END
                 ELSE
                 BEGIN
                     RAISERROR('Invalid or unsupported @mode parameter.', 16, 1);
@@ -1059,6 +1775,136 @@ namespace PROWESS_CRM.Services
                 PinCode = r["PIN_Code"]?.ToString()?.Trim(),
                 RegistrationStage = r["Registration_Stage"] as string ?? "DRAFT"
             };
+        }
+
+        public async Task<bool> AdvanceActivationStepAsync(
+            AdvanceActivationStepDto dto,
+            CancellationToken cancellationToken = default)
+        {
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            using var tx = (SqlTransaction)await conn.BeginTransactionAsync(cancellationToken);
+
+            try
+            {
+                string prodCode = dto.ProductCode.Trim().ToUpperInvariant();
+
+                // 1. Ensure Activation record exists
+                const string getActSql = @"
+                    SELECT Activation_Id, Current_Step_No, Is_On_Hold
+                    FROM dbo.Client_Product_Activation
+                    WHERE Client_Id = @ClientId AND Product_Code = @ProductCode;";
+
+                int actId = 0;
+                int curStep = 1;
+                string onHold = "N";
+
+                using (var cmd = new SqlCommand(getActSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                    cmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                    using var rdr = await cmd.ExecuteReaderAsync(cancellationToken);
+                    if (await rdr.ReadAsync(cancellationToken))
+                    {
+                        actId = Convert.ToInt32(rdr["Activation_Id"]);
+                        curStep = Convert.ToInt32(rdr["Current_Step_No"]);
+                        onHold = rdr["Is_On_Hold"]?.ToString()?.Trim() ?? "N";
+                    }
+                }
+
+                if (actId == 0)
+                {
+                    const string insActSql = @"
+                        INSERT INTO dbo.Client_Product_Activation (
+                            Client_Id, Product_Code, Current_Step_No, Activation_Status,
+                            Is_On_Hold, Created_By, Created_Date
+                        )
+                        OUTPUT INSERTED.Activation_Id
+                        VALUES (
+                            @ClientId, @ProductCode, 1, 'In Progress',
+                            'N', 1, GETDATE()
+                        );";
+
+                    using var insCmd = new SqlCommand(insActSql, conn, tx);
+                    insCmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                    insCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                    actId = Convert.ToInt32(await insCmd.ExecuteScalarAsync(cancellationToken));
+                }
+
+                if (dto.IsHoldToggle)
+                {
+                    string newHold = dto.NewHoldState ? "Y" : "N";
+                    string newStatus = dto.NewHoldState ? "On Hold" : (curStep >= 11 ? "Completed" : "In Progress");
+
+                    const string updateHoldSql = @"
+                        UPDATE dbo.Client_Product_Activation
+                        SET Is_On_Hold = @NewHold,
+                            Activation_Status = @NewStatus,
+                            Hold_Reason = @HoldReason,
+                            Modified_Date = GETDATE()
+                        WHERE Activation_Id = @ActivationId;";
+
+                    using var hCmd = new SqlCommand(updateHoldSql, conn, tx);
+                    hCmd.Parameters.AddWithValue("@NewHold", newHold);
+                    hCmd.Parameters.AddWithValue("@NewStatus", newStatus);
+                    hCmd.Parameters.AddWithValue("@HoldReason", DbStr(dto.Remarks));
+                    hCmd.Parameters.AddWithValue("@ActivationId", actId);
+                    await hCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+                else
+                {
+                    int nextStep = dto.TargetStepNo > 0 ? dto.TargetStepNo : (curStep + 1);
+                    if (nextStep > 11) nextStep = 11;
+                    string actStatus = nextStep >= 11 ? "Completed" : "In Progress";
+                    DateTime? techDone = nextStep >= 9 ? DateTime.Now : null;
+                    DateTime? goLive = nextStep >= 10 ? DateTime.Now : null;
+
+                    const string updateStepSql = @"
+                        UPDATE dbo.Client_Product_Activation
+                        SET Current_Step_No = @NextStep,
+                            Activation_Status = @ActStatus,
+                            Tech_Done_Date = COALESCE(Tech_Done_Date, @TechDone),
+                            Go_Live_Date = COALESCE(Go_Live_Date, @GoLive),
+                            Modified_Date = GETDATE()
+                        WHERE Activation_Id = @ActivationId;";
+
+                    using var sCmd = new SqlCommand(updateStepSql, conn, tx);
+                    sCmd.Parameters.AddWithValue("@NextStep", nextStep);
+                    sCmd.Parameters.AddWithValue("@ActStatus", actStatus);
+                    sCmd.Parameters.AddWithValue("@TechDone", DbVal(techDone));
+                    sCmd.Parameters.AddWithValue("@GoLive", DbVal(goLive));
+                    sCmd.Parameters.AddWithValue("@ActivationId", actId);
+                    await sCmd.ExecuteNonQueryAsync(cancellationToken);
+
+                    // Add history record for the completed step
+                    const string addHistSql = @"
+                        INSERT INTO dbo.Client_Activation_Step_History (
+                            Activation_Id, Step_No, Step_Name, Status,
+                            Completed_Date, Completed_By_User, User_Role, Remarks
+                        )
+                        VALUES (
+                            @ActivationId, @StepNo, @StepName, 'Completed',
+                            GETDATE(), @ByUser, @UserRole, @Remarks
+                        );";
+
+                    using var histCmd = new SqlCommand(addHistSql, conn, tx);
+                    histCmd.Parameters.AddWithValue("@ActivationId", actId);
+                    histCmd.Parameters.AddWithValue("@StepNo", nextStep);
+                    histCmd.Parameters.AddWithValue("@StepName", string.IsNullOrWhiteSpace(dto.StepName) ? $"Step {nextStep}" : dto.StepName.Trim());
+                    histCmd.Parameters.AddWithValue("@ByUser", string.IsNullOrWhiteSpace(dto.PerformedByUser) ? "User" : dto.PerformedByUser.Trim());
+                    histCmd.Parameters.AddWithValue("@UserRole", DbStr(dto.UserRole));
+                    histCmd.Parameters.AddWithValue("@Remarks", DbStr(dto.Remarks));
+                    await histCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await tx.CommitAsync(cancellationToken);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                _logger.LogError(ex, "Error advancing activation step for ClientId={ClientId}, Product={ProductCode}", dto.ClientId, dto.ProductCode);
+                throw;
+            }
         }
 
         public async Task<string> GenerateUniqueCustomerCodeAsync(string clientName, string? customerType = null, CancellationToken cancellationToken = default)
@@ -1155,6 +2001,342 @@ namespace PROWESS_CRM.Services
             }
             int remainder = Math.Abs(sum) % 26;
             return (char)('A' + remainder);
+        }
+        public async Task<bool> UpdateTechnicalConfigAsync(UpdateTechnicalConfigDto dto, CancellationToken cancellationToken = default)
+        {
+            if (dto == null || dto.ClientId <= 0) return false;
+            if (dto.CreatedBy <= 0)
+            {
+                throw new ArgumentException("CreatedBy user ID is required and must be greater than 0.");
+            }
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            using var transaction = conn.BeginTransaction();
+            try
+            {
+                string prodCode = string.IsNullOrWhiteSpace(dto.ProductCode) ? "ERP" : dto.ProductCode.Trim().ToUpperInvariant();
+                int actorUserId = dto.CreatedBy;
+                string actor = actorUserId.ToString();
+
+                // 1. Calculate next version label
+                const string countSql = @"
+                    SELECT COUNT(1) FROM dbo.Client_Technical_History 
+                    WHERE Client_Id = @ClientId AND Product_Code = @ProductCode;";
+                int histCount = 0;
+                using (var cCmd = new SqlCommand(countSql, conn, transaction))
+                {
+                    cCmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                    cCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                    var obj = await cCmd.ExecuteScalarAsync(cancellationToken);
+                    histCount = (obj != null && obj != DBNull.Value) ? Convert.ToInt32(obj) : 0;
+                }
+                string verLabel = "v" + (histCount + 1);
+
+                // 2. Insert into dbo.Client_Technical_History
+                const string insHistSql = @"
+                    INSERT INTO dbo.Client_Technical_History (
+                        Client_Id, Product_Code, Version_Label, Field_Name,
+                        Previous_Value, New_Value, Change_Reason, Created_By, Created_Date
+                    )
+                    VALUES (
+                        @ClientId, @ProductCode, @VersionLabel, @FieldName,
+                        @PreviousValue, @NewValue, @ChangeReason, @CreatedBy, GETDATE()
+                    );";
+                using (var hCmd = new SqlCommand(insHistSql, conn, transaction))
+                {
+                    hCmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                    hCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                    hCmd.Parameters.AddWithValue("@VersionLabel", verLabel);
+                    hCmd.Parameters.AddWithValue("@FieldName", string.IsNullOrWhiteSpace(dto.FieldName) ? "Configuration Update" : dto.FieldName.Trim());
+                    hCmd.Parameters.AddWithValue("@PreviousValue", DbStr(dto.PreviousValue));
+                    hCmd.Parameters.AddWithValue("@NewValue", DbStr(dto.NewValue));
+                    hCmd.Parameters.AddWithValue("@ChangeReason", DbStr(dto.ChangeReason));
+                    hCmd.Parameters.AddWithValue("@CreatedBy", actor);
+                    await hCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                // 3. If UpdatedConfig is provided, upsert into dbo.Client_Technical_Config
+                if (dto.UpdatedConfig != null)
+                {
+                    const string upsertTechSql = @"
+                        IF EXISTS (SELECT 1 FROM dbo.Client_Technical_Config WHERE Client_Id = @ClientId AND Product_Code = @ProductCode)
+                        BEGIN
+                            UPDATE dbo.Client_Technical_Config
+                            SET Deployment_Type   = @DeploymentType,
+                                SQL_Version       = @SqlVersion,
+                                Server_Host       = @ServerHost,
+                                Port              = @Port,
+                                Database_Name     = @DatabaseName,
+                                DB_User           = @DbUser,
+                                DB_Password       = @DbPassword,
+                                Connection_String = @ConnectionString,
+                                Published_App_Url = @PublishedAppUrl,
+                                Api_Url           = @ApiUrl,
+                                Is_Active         = @IsActive,
+                                Technical_Remarks = @TechnicalRemarks,
+                                Modified_By       = @CreatedBy,
+                                Modified_Date     = GETDATE()
+                            WHERE Client_Id = @ClientId AND Product_Code = @ProductCode;
+                        END
+                        ELSE
+                        BEGIN
+                            INSERT INTO dbo.Client_Technical_Config (
+                                Client_Id, Product_Code, Deployment_Type, SQL_Version,
+                                Server_Host, Port, Database_Name, DB_User, DB_Password,
+                                Connection_String, Published_App_Url, Api_Url,
+                                Is_Active, Technical_Remarks, Created_By, Created_Date
+                            )
+                            VALUES (
+                                @ClientId, @ProductCode, @DeploymentType, @SqlVersion,
+                                @ServerHost, @Port, @DatabaseName, @DbUser, @DbPassword,
+                                @ConnectionString, @PublishedAppUrl, @ApiUrl,
+                                @IsActive, @TechnicalRemarks, @CreatedBy, GETDATE()
+                            );
+                        END";
+
+                    var tc = dto.UpdatedConfig;
+                    string deploy = tc.DeploymentType == "Standalone" ? "Standalone" : "Cloud";
+                    string dbName = string.IsNullOrWhiteSpace(tc.DatabaseName) ? $"DB_{dto.ClientId}_{prodCode}" : tc.DatabaseName.Trim();
+
+                    using var tCmd = new SqlCommand(upsertTechSql, conn, transaction);
+                    tCmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                    tCmd.Parameters.AddWithValue("@ProductCode", prodCode);
+                    tCmd.Parameters.AddWithValue("@DeploymentType", deploy);
+                    tCmd.Parameters.AddWithValue("@SqlVersion", DbStr(tc.SqlVersion) ?? (object)"SQL Server 2022");
+                    tCmd.Parameters.AddWithValue("@ServerHost", DbStr(tc.ServerHost));
+                    tCmd.Parameters.AddWithValue("@Port", DbVal(tc.Port ?? 1433));
+                    tCmd.Parameters.AddWithValue("@DatabaseName", dbName);
+                    tCmd.Parameters.AddWithValue("@DbUser", DbStr(tc.DbUser));
+                    tCmd.Parameters.AddWithValue("@DbPassword", DbStr(tc.DbPassword));
+                    tCmd.Parameters.AddWithValue("@ConnectionString", DbStr(tc.ConnectionString));
+                    tCmd.Parameters.AddWithValue("@PublishedAppUrl", DbStr(tc.PublishedAppUrl));
+                    tCmd.Parameters.AddWithValue("@ApiUrl", DbStr(tc.ApiUrl));
+                    tCmd.Parameters.AddWithValue("@IsActive", NormalizeYN(tc.IsActive, "Y"));
+                    tCmd.Parameters.AddWithValue("@TechnicalRemarks", DbStr(tc.TechnicalRemarks));
+                    tCmd.Parameters.AddWithValue("@CreatedBy", actor);
+                    await tCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await transaction.CommitAsync(cancellationToken);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                _logger.LogError(ex, "Error updating technical config for Client_Id={ClientId}", dto.ClientId);
+                throw;
+            }
+        }
+
+        public async Task<ClientDocumentDto> UploadDocumentAsync(
+            UploadClientDocumentDto dto,
+            int actorUserId = 0,
+            CancellationToken cancellationToken = default)
+        {
+            if (actorUserId <= 0)
+            {
+                actorUserId = dto.CreatedBy;
+            }
+            if (actorUserId <= 0)
+            {
+                throw new ArgumentException("CreatedBy user ID is required and must be greater than 0.");
+            }
+
+            if (dto.File == null || dto.File.Length == 0)
+            {
+                throw new ArgumentException("No valid file uploaded.");
+            }
+
+            // 1. Prepare target client directory on C: drive
+            var clientFolder = Path.Combine(_baseStoragePath, $"Client_{dto.ClientId}");
+            if (!Directory.Exists(clientFolder))
+            {
+                Directory.CreateDirectory(clientFolder);
+            }
+
+            var originalFileName = Path.GetFileName(dto.File.FileName);
+            var extension = Path.GetExtension(originalFileName);
+            var safeBaseName = Path.GetFileNameWithoutExtension(originalFileName);
+            // Unique filename with timestamp & short guid
+            var storedFileName = $"{safeBaseName}_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N").Substring(0, 6)}{extension}";
+            var fullPhysicalPath = Path.Combine(clientFolder, storedFileName);
+
+            // 2. Save physical file to C: drive
+            using (var stream = new FileStream(fullPhysicalPath, FileMode.Create, FileAccess.Write))
+            {
+                await dto.File.CopyToAsync(stream, cancellationToken);
+            }
+
+            _logger.LogInformation("Physical file saved to disk at {FilePath}", fullPhysicalPath);
+
+            // 3. Insert record into dbo.Client_Document
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            const string insertSql = @"
+                INSERT INTO dbo.Client_Document (
+                    Client_Id, Document_Name, Original_File_Name, Stored_File_Name,
+                    File_Path, File_Extension, File_Size_Bytes, Content_Type,
+                    Document_Category, Document_Version, Expiry_Date, Access_Level,
+                    Is_Active, Created_By, Created_Date
+                )
+                OUTPUT INSERTED.Document_Id, INSERTED.Created_Date
+                VALUES (
+                    @ClientId, @DocumentName, @OriginalFileName, @StoredFileName,
+                    @FilePath, @FileExtension, @FileSizeBytes, @ContentType,
+                    @DocumentCategory, @DocumentVersion, @ExpiryDate, @AccessLevel,
+                    'Y', @CreatedBy, GETDATE()
+                );";
+
+            int documentId;
+            DateTime createdDate;
+
+            using (var cmd = new SqlCommand(insertSql, conn))
+            {
+                cmd.Parameters.AddWithValue("@ClientId", dto.ClientId);
+                cmd.Parameters.AddWithValue("@DocumentName", dto.DocumentName.Trim());
+                cmd.Parameters.AddWithValue("@OriginalFileName", originalFileName);
+                cmd.Parameters.AddWithValue("@StoredFileName", storedFileName);
+                cmd.Parameters.AddWithValue("@FilePath", fullPhysicalPath);
+                cmd.Parameters.AddWithValue("@FileExtension", extension);
+                cmd.Parameters.AddWithValue("@FileSizeBytes", dto.File.Length);
+                cmd.Parameters.AddWithValue("@ContentType", dto.File.ContentType ?? "application/octet-stream");
+                cmd.Parameters.AddWithValue("@DocumentCategory", string.IsNullOrWhiteSpace(dto.Category) ? "Other Documents" : dto.Category.Trim());
+                cmd.Parameters.AddWithValue("@DocumentVersion", string.IsNullOrWhiteSpace(dto.Version) ? "v1" : dto.Version.Trim());
+                cmd.Parameters.AddWithValue("@ExpiryDate", dto.ExpiryDate.HasValue ? (object)dto.ExpiryDate.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@AccessLevel", string.IsNullOrWhiteSpace(dto.AccessLevel) ? "all" : dto.AccessLevel.Trim());
+                cmd.Parameters.AddWithValue("@CreatedBy", actorUserId);
+
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                if (await reader.ReadAsync(cancellationToken))
+                {
+                    documentId = Convert.ToInt32(reader["Document_Id"]);
+                    createdDate = Convert.ToDateTime(reader["Created_Date"]);
+                }
+                else
+                {
+                    throw new InvalidOperationException("Failed to insert document record into database.");
+                }
+            }
+
+            return new ClientDocumentDto
+            {
+                DocumentId = documentId,
+                ClientId = dto.ClientId,
+                DocumentName = dto.DocumentName,
+                OriginalFileName = originalFileName,
+                StoredFileName = storedFileName,
+                FilePath = fullPhysicalPath,
+                FileExtension = extension,
+                FileSizeBytes = dto.File.Length,
+                ContentType = dto.File.ContentType,
+                DocumentCategory = dto.Category,
+                DocumentVersion = dto.Version,
+                ExpiryDate = dto.ExpiryDate,
+                AccessLevel = dto.AccessLevel,
+                IsActive = "Y",
+                CreatedBy = actorUserId,
+                CreatedDate = createdDate
+            };
+        }
+
+        public async Task<IEnumerable<ClientDocumentDto>> GetDocumentsByClientIdAsync(int clientId, CancellationToken cancellationToken = default)
+        {
+            var list = new List<ClientDocumentDto>();
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+
+            const string sql = @"
+                SELECT d.Document_Id, d.Client_Id, d.Document_Name, d.Original_File_Name,
+                       d.Stored_File_Name, d.File_Path, d.File_Extension, d.File_Size_Bytes,
+                       d.Content_Type, d.Document_Category, d.Document_Version, d.Expiry_Date,
+                       d.Access_Level, d.Is_Active, d.Created_By, d.Created_Date,
+                       u.FullName AS CreatedByName
+                FROM dbo.Client_Document d
+                LEFT JOIN dbo.UserMaster u ON d.Created_By = u.UserId
+                WHERE d.Client_Id = @ClientId AND d.Is_Active = 'Y'
+                ORDER BY d.Document_Id DESC;";
+
+            using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@ClientId", clientId);
+
+            using var rdr = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await rdr.ReadAsync(cancellationToken))
+            {
+                list.Add(new ClientDocumentDto
+                {
+                    DocumentId = Convert.ToInt32(rdr["Document_Id"]),
+                    ClientId = Convert.ToInt32(rdr["Client_Id"]),
+                    DocumentName = rdr["Document_Name"]?.ToString() ?? string.Empty,
+                    OriginalFileName = rdr["Original_File_Name"]?.ToString() ?? string.Empty,
+                    StoredFileName = rdr["Stored_File_Name"]?.ToString() ?? string.Empty,
+                    FilePath = rdr["File_Path"]?.ToString() ?? string.Empty,
+                    FileExtension = rdr["File_Extension"]?.ToString() ?? string.Empty,
+                    FileSizeBytes = rdr["File_Size_Bytes"] == DBNull.Value ? null : Convert.ToInt64(rdr["File_Size_Bytes"]),
+                    ContentType = rdr["Content_Type"] as string,
+                    DocumentCategory = rdr["Document_Category"]?.ToString() ?? "Other Documents",
+                    DocumentVersion = rdr["Document_Version"]?.ToString() ?? "v1",
+                    ExpiryDate = rdr["Expiry_Date"] == DBNull.Value ? null : Convert.ToDateTime(rdr["Expiry_Date"]),
+                    AccessLevel = rdr["Access_Level"]?.ToString() ?? "all",
+                    IsActive = rdr["Is_Active"]?.ToString() ?? "Y",
+                    CreatedBy = Convert.ToInt32(rdr["Created_By"]),
+                    CreatedByName = rdr["CreatedByName"] as string,
+                    CreatedDate = Convert.ToDateTime(rdr["Created_Date"])
+                });
+            }
+
+            return list;
+        }
+
+        public async Task<(byte[] FileBytes, string ContentType, string DownloadFileName)?> GetDocumentFileAsync(
+            int documentId,
+            CancellationToken cancellationToken = default)
+        {
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            const string sql = @"
+                SELECT File_Path, Content_Type, Original_File_Name
+                FROM dbo.Client_Document
+                WHERE Document_Id = @DocumentId AND Is_Active = 'Y';";
+
+            using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@DocumentId", documentId);
+
+            string? filePath = null;
+            string? contentType = null;
+            string? originalName = null;
+
+            using (var rdr = await cmd.ExecuteReaderAsync(cancellationToken))
+            {
+                if (await rdr.ReadAsync(cancellationToken))
+                {
+                    filePath = rdr["File_Path"]?.ToString();
+                    contentType = rdr["Content_Type"]?.ToString();
+                    originalName = rdr["Original_File_Name"]?.ToString();
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            {
+                _logger.LogWarning("Physical file not found for Document_Id={DocumentId} at path {FilePath}", documentId, filePath);
+                return null;
+            }
+
+            var bytes = await File.ReadAllBytesAsync(filePath, cancellationToken);
+            return (bytes, contentType ?? "application/octet-stream", originalName ?? Path.GetFileName(filePath));
+        }
+
+        public async Task<bool> DeleteDocumentAsync(int documentId, int actorUserId = 1, CancellationToken cancellationToken = default)
+        {
+            using var conn = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            const string sql = @"
+                UPDATE dbo.Client_Document
+                SET Is_Active = 'N',
+                    Modified_By = @ModifiedBy,
+                    Modified_Date = GETDATE()
+                WHERE Document_Id = @DocumentId;";
+
+            using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@DocumentId", documentId);
+            cmd.Parameters.AddWithValue("@ModifiedBy", actorUserId);
+
+            int affected = await cmd.ExecuteNonQueryAsync(cancellationToken);
+            return affected > 0;
         }
     }
 }
