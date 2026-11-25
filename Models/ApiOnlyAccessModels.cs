@@ -93,6 +93,7 @@ namespace PROWESS_CRM.Models
         public char hrms_admin_access { get; set; } = 'N';
         public char hrms_api_access { get; set; } = 'N';
         public char is_active { get; set; } = 'Y';
+        public List<int> module_ids { get; set; } = new();
     }
 
     public class api_customer_mapping_dto

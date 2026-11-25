@@ -221,6 +221,11 @@ namespace PROWESS_CRM.Controllers
                 var list = await _apiOnlyAccessService.get_customer_mappings(clientId, cancellationToken);
                 return Ok(ApiResponse<IEnumerable<api_customer_mapping_dto>>.SuccessResponse(list));
             }
+            catch (OperationCanceledException)
+            {
+                // Client cancelled or disconnected (e.g. browser refreshed or navigated away)
+                return StatusCode(StatusCodes.Status499ClientClosedRequest, ApiResponse<IEnumerable<api_customer_mapping_dto>>.FailureResponse("Request was cancelled by client."));
+            }
             catch (Exception ex)
             {
                 return StatusCode(500, ApiResponse<IEnumerable<api_customer_mapping_dto>>.FailureResponse(
@@ -251,6 +256,16 @@ namespace PROWESS_CRM.Controllers
                     cancellationToken);
 
                 return Ok(ApiResponse<bool>.SuccessResponse(saved, "Customer API mappings saved successfully."));
+            }
+            catch (OperationCanceledException)
+            {
+                return StatusCode(StatusCodes.Status499ClientClosedRequest, ApiResponse<bool>.FailureResponse("Request was cancelled by client."));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return StatusCode(StatusCodes.Status502BadGateway, ApiResponse<bool>.FailureResponse(
+                    ex.Message,
+                    new List<string> { ex.Message }));
             }
             catch (Exception ex)
             {
