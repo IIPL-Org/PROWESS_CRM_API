@@ -83,4 +83,48 @@ namespace PROWESS_CRM.Models
         public int? CreatedBy { get; set; }
         public int? ModifiedBy { get; set; }
     }
+
+    public class client_master_dto
+    {
+        public int client_id { get; set; }
+        public string client_name { get; set; } = string.Empty;
+        public string? hrms_admin_link { get; set; }
+        public string? hrms_api_link { get; set; }
+        public char hrms_admin_access { get; set; } = 'N';
+        public char hrms_api_access { get; set; } = 'N';
+        public char is_active { get; set; } = 'Y';
+        public List<int> module_ids { get; set; } = new();
+    }
+
+    public class api_customer_mapping_dto
+    {
+        public int api_customer_mapping_id { get; set; }
+        public int client_id { get; set; }
+        public string? client_name { get; set; }
+        public int api_master_id { get; set; }
+        public string api_code { get; set; } = string.Empty;
+        public string onward_exposure { get; set; } = "Internal";
+        public string? consumer_types { get; set; }
+        public string max_data_scope { get; set; } = "Own";
+        public string sensitivity { get; set; } = "Normal";
+        public string? credentials { get; set; }
+        public int? max_rate_per_min { get; set; }
+        public long? monthly_quota { get; set; }
+        public char require_ip_whitelist { get; set; } = 'N';
+        public char require_idempotency_key { get; set; } = 'N';
+        public char sandbox_available { get; set; } = 'N';
+        public DateTime? valid_till { get; set; }
+        public char is_active { get; set; } = 'Y';
+        public int created_by { get; set; } = 1;
+        public DateTime created_date { get; set; } = DateTime.Now;
+        public int? modified_by { get; set; }
+        public DateTime? modified_date { get; set; }
+    }
+
+    public class save_customer_mappings_request
+    {
+        public int client_id { get; set; }
+        public string? client_name { get; set; }
+        public List<api_customer_mapping_dto> mappings { get; set; } = new();
+    }
 }

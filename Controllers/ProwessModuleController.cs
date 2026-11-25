@@ -20,6 +20,7 @@ namespace PROWESS_CRM.Controllers
         /// Retrieves all active Prowess ERP modules from Prowess_Module_Master.
         /// </summary>
         [HttpGet]
+        [HttpGet("GetAllProwessModules")]
         [ProducesResponseType(typeof(ApiResponse<IEnumerable<ProwessModuleMaster>>), StatusCodes.Status200OK)]
         public async Task<ActionResult<ApiResponse<IEnumerable<ProwessModuleMaster>>>> GetAllProwessModules(CancellationToken cancellationToken)
         {

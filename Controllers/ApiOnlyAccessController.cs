@@ -191,5 +191,88 @@ namespace PROWESS_CRM.Controllers
             var idClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
             return int.TryParse(idClaim, out int uid) && uid > 0 ? uid : 1;
         }
+
+        [HttpGet("get_client_master")]
+        [ProducesResponseType(typeof(ApiResponse<IEnumerable<client_master_dto>>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<IEnumerable<client_master_dto>>>> get_client_master(
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var list = await _apiOnlyAccessService.get_client_master(cancellationToken);
+                return Ok(ApiResponse<IEnumerable<client_master_dto>>.SuccessResponse(list));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<IEnumerable<client_master_dto>>.FailureResponse(
+                    "An error occurred while fetching clients from Client_Master.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        [HttpGet("ApiCustomerMapping")]
+        [ProducesResponseType(typeof(ApiResponse<IEnumerable<api_customer_mapping_dto>>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<IEnumerable<api_customer_mapping_dto>>>> GetApiCustomerMapping(
+            [FromQuery] int? clientId = null,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var list = await _apiOnlyAccessService.get_customer_mappings(clientId, cancellationToken);
+                return Ok(ApiResponse<IEnumerable<api_customer_mapping_dto>>.SuccessResponse(list));
+            }
+            catch (OperationCanceledException)
+            {
+                // Client cancelled or disconnected (e.g. browser refreshed or navigated away)
+                return StatusCode(StatusCodes.Status499ClientClosedRequest, ApiResponse<IEnumerable<api_customer_mapping_dto>>.FailureResponse("Request was cancelled by client."));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<IEnumerable<api_customer_mapping_dto>>.FailureResponse(
+                    "An error occurred while fetching customer mappings.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        [HttpPost("ApiCustomerMapping")]
+        [ProducesResponseType(typeof(ApiResponse<bool>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<bool>>> PostApiCustomerMapping(
+            [FromBody] save_customer_mappings_request request,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                if (request.client_id <= 0)
+                {
+                    return BadRequest(ApiResponse<bool>.FailureResponse("Valid client_id is required."));
+                }
+
+                int userId = GetCurrentUserId();
+                bool saved = await _apiOnlyAccessService.save_customer_mappings(
+                    request.client_id,
+                    request.client_name,
+                    request.mappings,
+                    userId,
+                    cancellationToken);
+
+                return Ok(ApiResponse<bool>.SuccessResponse(saved, "Customer API mappings saved successfully."));
+            }
+            catch (OperationCanceledException)
+            {
+                return StatusCode(StatusCodes.Status499ClientClosedRequest, ApiResponse<bool>.FailureResponse("Request was cancelled by client."));
+            }
+            catch (InvalidOperationException ex)
+            {
+                return StatusCode(StatusCodes.Status502BadGateway, ApiResponse<bool>.FailureResponse(
+                    ex.Message,
+                    new List<string> { ex.Message }));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<bool>.FailureResponse(
+                    "An error occurred while saving customer mappings.",
+                    new List<string> { ex.Message }));
+            }
+        }
     }
 }

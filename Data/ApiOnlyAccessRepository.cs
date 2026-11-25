@@ -12,6 +12,10 @@ namespace PROWESS_CRM.Data
         Task<ProwessApiMasterDto> CreateApiAsync(SaveProwessApiRequest request, int userId, CancellationToken cancellationToken = default);
         Task<ProwessApiMasterDto?> UpdateApiAsync(int apiMasterId, SaveProwessApiRequest request, int userId, CancellationToken cancellationToken = default);
         Task<bool> DeleteApiAsync(int apiMasterId, int userId, CancellationToken cancellationToken = default);
+        Task<IEnumerable<client_master_dto>> get_client_master(CancellationToken cancellationToken = default);
+        Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default);
+        Task<bool> save_customer_mappings(int clientId, string? clientName, IEnumerable<api_customer_mapping_dto> mappings, int userId, Func<Task<(bool Success, string Error)>>? onBeforeCommitAsync = null, CancellationToken cancellationToken = default);
+        Task<string?> get_client_hrms_link(int clientId, CancellationToken cancellationToken = default);
     }
 
     public class ApiOnlyAccessRepository : IApiOnlyAccessRepository
@@ -483,6 +487,436 @@ namespace PROWESS_CRM.Data
                 ModifiedBy = reader.IsDBNull(modByOrd) ? null : Convert.ToInt32(reader.GetValue(modByOrd)),
                 ModifiedDate = reader.IsDBNull(modDateOrd) ? null : Convert.ToDateTime(reader.GetValue(modDateOrd))
             };
+        }
+
+        public async Task<IEnumerable<client_master_dto>> get_client_master(CancellationToken cancellationToken = default)
+        {
+            var list = new List<client_master_dto>();
+            const string sql = @"
+                SELECT 
+                    Client_Id,
+                    Client_Name,
+                    HRMS_Admin_Link,
+                    HRMS_API_Link,
+                    ISNULL(HRMS_Admin_Access, 'N') AS HRMS_Admin_Access,
+                    ISNULL(HRMS_API_Access, 'N') AS HRMS_API_Access,
+                    ISNULL(Is_Active, 'Y') AS Is_Active
+                FROM dbo.Client_Master
+                ORDER BY Client_Name ASC;";
+
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            using var command = new SqlCommand(sql, connection);
+            using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            int idOrd = reader.GetOrdinal("Client_Id");
+            int nameOrd = reader.GetOrdinal("Client_Name");
+            int adminLinkOrd = reader.GetOrdinal("HRMS_Admin_Link");
+            int apiLinkOrd = reader.GetOrdinal("HRMS_API_Link");
+            int adminAccessOrd = reader.GetOrdinal("HRMS_Admin_Access");
+            int apiAccessOrd = reader.GetOrdinal("HRMS_API_Access");
+            int activeOrd = reader.GetOrdinal("Is_Active");
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                string adminAccessStr = reader.IsDBNull(adminAccessOrd) ? "N" : Convert.ToString(reader.GetValue(adminAccessOrd))?.Trim() ?? "N";
+                string apiAccessStr = reader.IsDBNull(apiAccessOrd) ? "N" : Convert.ToString(reader.GetValue(apiAccessOrd))?.Trim() ?? "N";
+                string activeStr = reader.IsDBNull(activeOrd) ? "Y" : Convert.ToString(reader.GetValue(activeOrd))?.Trim() ?? "Y";
+
+                list.Add(new client_master_dto
+                {
+                    client_id = reader.IsDBNull(idOrd) ? 0 : Convert.ToInt32(reader.GetValue(idOrd)),
+                    client_name = reader.IsDBNull(nameOrd) ? string.Empty : Convert.ToString(reader.GetValue(nameOrd))?.Trim() ?? string.Empty,
+                    hrms_admin_link = reader.IsDBNull(adminLinkOrd) ? null : Convert.ToString(reader.GetValue(adminLinkOrd))?.Trim(),
+                    hrms_api_link = reader.IsDBNull(apiLinkOrd) ? null : Convert.ToString(reader.GetValue(apiLinkOrd))?.Trim(),
+                    hrms_admin_access = string.IsNullOrEmpty(adminAccessStr) ? 'N' : char.ToUpperInvariant(adminAccessStr[0]),
+                    hrms_api_access = string.IsNullOrEmpty(apiAccessStr) ? 'N' : char.ToUpperInvariant(apiAccessStr[0]),
+                    is_active = string.IsNullOrEmpty(activeStr) ? 'Y' : char.ToUpperInvariant(activeStr[0])
+                });
+            }
+
+            // Fetch module rights from Prowess_Client_Modules (fallback to Client_Modules)
+            const string modSql = @"
+                IF OBJECT_ID(N'dbo.Prowess_Client_Modules', N'U') IS NOT NULL
+                    SELECT Client_Id, Module_Id FROM dbo.Prowess_Client_Modules WITH (NOLOCK);
+                ELSE IF OBJECT_ID(N'dbo.Client_Modules', N'U') IS NOT NULL
+                    SELECT Client_Id, Module_Id FROM dbo.Client_Modules WITH (NOLOCK);";
+
+            var modulesByClient = new Dictionary<int, List<int>>();
+            try
+            {
+                using var modCmd = new SqlCommand(modSql, connection);
+                modCmd.CommandTimeout = 15;
+                using var modReader = await modCmd.ExecuteReaderAsync(cancellationToken);
+                while (await modReader.ReadAsync(cancellationToken))
+                {
+                    int cid = modReader.GetInt32(0);
+                    int mid = modReader.GetInt32(1);
+                    if (!modulesByClient.TryGetValue(cid, out var mList))
+                    {
+                        mList = new List<int>();
+                        modulesByClient[cid] = mList;
+                    }
+                    mList.Add(mid);
+                }
+            }
+            catch
+            {
+                // Proceed gracefully if table does not exist yet
+            }
+
+            foreach (var client in list)
+            {
+                if (modulesByClient.TryGetValue(client.client_id, out var mods))
+                {
+                    client.module_ids = mods;
+                }
+            }
+
+            return list;
+        }
+
+        public async Task<string?> get_client_hrms_link(int clientId, CancellationToken cancellationToken = default)
+        {
+            const string sql = "SELECT TOP 1 HRMS_API_Link FROM dbo.Client_Master WITH (NOLOCK) WHERE Client_Id = @ClientId;";
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var command = new SqlCommand(sql, connection);
+                command.CommandTimeout = 15;
+                command.Parameters.AddWithValue("@ClientId", clientId);
+                var result = await command.ExecuteScalarAsync(cancellationToken);
+                return result == null || result == DBNull.Value ? null : Convert.ToString(result)?.Trim();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public async Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default)
+        {
+            var list = new List<api_customer_mapping_dto>();
+
+            string BuildSelectSql(string tableName) => $@"
+                SELECT 
+                    Api_Customer_Mapping_Id,
+                    Client_Id,
+                    Client_Name,
+                    Api_Master_Id,
+                    Api_Code,
+                    Onward_Exposure,
+                    Consumer_Types,
+                    Max_Data_Scope,
+                    Sensitivity,
+                    Credentials,
+                    Max_Rate_Per_Min,
+                    Monthly_Quota,
+                    Require_Ip_Whitelist,
+                    Require_Idempotency_Key,
+                    Sandbox_Available,
+                    Valid_Till,
+                    Is_Active,
+                    Created_By,
+                    Created_Date,
+                    Modified_By,
+                    Modified_Date
+                FROM dbo.{tableName} WITH (NOLOCK)
+                WHERE UPPER(ISNULL(Is_Active, 'Y')) = 'Y'
+                  AND (@ClientId IS NULL OR Client_Id = @ClientId)
+                ORDER BY Client_Id ASC, Api_Customer_Mapping_Id ASC;";
+
+            async Task<bool> TryQueryTableAsync(SqlConnection connection, string tableName)
+            {
+                using var command = new SqlCommand(BuildSelectSql(tableName), connection);
+                command.CommandTimeout = 30;
+                command.Parameters.AddWithValue("@ClientId", clientId.HasValue ? (object)clientId.Value : DBNull.Value);
+
+                using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                int mapIdOrd = reader.GetOrdinal("Api_Customer_Mapping_Id");
+                int clientIdOrd = reader.GetOrdinal("Client_Id");
+                int clientNameOrd = reader.GetOrdinal("Client_Name");
+                int apiMasterIdOrd = reader.GetOrdinal("Api_Master_Id");
+                int apiCodeOrd = reader.GetOrdinal("Api_Code");
+                int exposureOrd = reader.GetOrdinal("Onward_Exposure");
+                int consumersOrd = reader.GetOrdinal("Consumer_Types");
+                int scopeOrd = reader.GetOrdinal("Max_Data_Scope");
+                int sensOrd = reader.GetOrdinal("Sensitivity");
+                int credsOrd = reader.GetOrdinal("Credentials");
+                int rateOrd = reader.GetOrdinal("Max_Rate_Per_Min");
+                int quotaOrd = reader.GetOrdinal("Monthly_Quota");
+                int ipWlOrd = reader.GetOrdinal("Require_Ip_Whitelist");
+                int idemOrd = reader.GetOrdinal("Require_Idempotency_Key");
+                int sbOrd = reader.GetOrdinal("Sandbox_Available");
+                int tillOrd = reader.GetOrdinal("Valid_Till");
+                int activeOrd = reader.GetOrdinal("Is_Active");
+                int createdByOrd = reader.GetOrdinal("Created_By");
+                int createdDateOrd = reader.GetOrdinal("Created_Date");
+                int modifiedByOrd = reader.GetOrdinal("Modified_By");
+                int modifiedDateOrd = reader.GetOrdinal("Modified_Date");
+
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    string ipWl = reader.IsDBNull(ipWlOrd) ? "N" : Convert.ToString(reader.GetValue(ipWlOrd))?.Trim() ?? "N";
+                    string idem = reader.IsDBNull(idemOrd) ? "N" : Convert.ToString(reader.GetValue(idemOrd))?.Trim() ?? "N";
+                    string sb = reader.IsDBNull(sbOrd) ? "N" : Convert.ToString(reader.GetValue(sbOrd))?.Trim() ?? "N";
+                    string active = reader.IsDBNull(activeOrd) ? "Y" : Convert.ToString(reader.GetValue(activeOrd))?.Trim() ?? "Y";
+
+                    list.Add(new api_customer_mapping_dto
+                    {
+                        api_customer_mapping_id = reader.GetInt32(mapIdOrd),
+                        client_id = reader.GetInt32(clientIdOrd),
+                        client_name = reader.IsDBNull(clientNameOrd) ? null : Convert.ToString(reader.GetValue(clientNameOrd)),
+                        api_master_id = reader.GetInt32(apiMasterIdOrd),
+                        api_code = reader.IsDBNull(apiCodeOrd) ? string.Empty : Convert.ToString(reader.GetValue(apiCodeOrd))?.Trim() ?? string.Empty,
+                        onward_exposure = reader.IsDBNull(exposureOrd) ? "Internal" : Convert.ToString(reader.GetValue(exposureOrd))?.Trim() ?? "Internal",
+                        consumer_types = reader.IsDBNull(consumersOrd) ? null : Convert.ToString(reader.GetValue(consumersOrd))?.Trim(),
+                        max_data_scope = reader.IsDBNull(scopeOrd) ? "Own" : Convert.ToString(reader.GetValue(scopeOrd))?.Trim() ?? "Own",
+                        sensitivity = reader.IsDBNull(sensOrd) ? "Normal" : Convert.ToString(reader.GetValue(sensOrd))?.Trim() ?? "Normal",
+                        credentials = reader.IsDBNull(credsOrd) ? null : Convert.ToString(reader.GetValue(credsOrd))?.Trim(),
+                        max_rate_per_min = reader.IsDBNull(rateOrd) ? null : Convert.ToInt32(reader.GetValue(rateOrd)),
+                        monthly_quota = reader.IsDBNull(quotaOrd) ? null : Convert.ToInt64(reader.GetValue(quotaOrd)),
+                        require_ip_whitelist = string.IsNullOrEmpty(ipWl) ? 'N' : char.ToUpperInvariant(ipWl[0]),
+                        require_idempotency_key = string.IsNullOrEmpty(idem) ? 'N' : char.ToUpperInvariant(idem[0]),
+                        sandbox_available = string.IsNullOrEmpty(sb) ? 'N' : char.ToUpperInvariant(sb[0]),
+                        valid_till = reader.IsDBNull(tillOrd) ? null : Convert.ToDateTime(reader.GetValue(tillOrd)),
+                        is_active = string.IsNullOrEmpty(active) ? 'Y' : char.ToUpperInvariant(active[0]),
+                        created_by = reader.IsDBNull(createdByOrd) ? 1 : Convert.ToInt32(reader.GetValue(createdByOrd)),
+                        created_date = reader.IsDBNull(createdDateOrd) ? DateTime.Now : Convert.ToDateTime(reader.GetValue(createdDateOrd)),
+                        modified_by = reader.IsDBNull(modifiedByOrd) ? null : Convert.ToInt32(reader.GetValue(modifiedByOrd)),
+                        modified_date = reader.IsDBNull(modifiedDateOrd) ? null : Convert.ToDateTime(reader.GetValue(modifiedDateOrd))
+                    });
+                }
+
+                return true;
+            }
+
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                try
+                {
+                    await TryQueryTableAsync(connection, "ApiCustomerMapping");
+                }
+                catch (SqlException ex) when (ex.Number == 208)
+                {
+                    // Fallback to alternate table name if ApiCustomerMapping doesn't exist
+                    await TryQueryTableAsync(connection, "Prowess_Api_Customer_Mapping");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Return gracefully if client cancelled request
+                return list;
+            }
+            catch (SqlException ex) when (ex.Number == 208)
+            {
+                return list;
+            }
+
+            return list;
+        }
+
+        public async Task<bool> save_customer_mappings(
+            int clientId,
+            string? clientName,
+            IEnumerable<api_customer_mapping_dto> mappings,
+            int userId,
+            Func<Task<(bool Success, string Error)>>? onBeforeCommitAsync = null,
+            CancellationToken cancellationToken = default)
+        {
+            var mappingList = mappings?.ToList() ?? new List<api_customer_mapping_dto>();
+
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction();
+
+            string ResolveTableName()
+            {
+                try
+                {
+                    using var checkCmd = new SqlCommand("SELECT TOP 1 1 FROM dbo.ApiCustomerMapping WITH (NOLOCK);", connection, transaction);
+                    checkCmd.ExecuteScalar();
+                    return "ApiCustomerMapping";
+                }
+                catch (SqlException ex) when (ex.Number == 208)
+                {
+                    return "Prowess_Api_Customer_Mapping";
+                }
+            }
+
+            try
+            {
+                // 1. Verify module rights from Prowess_Client_Modules (or Client_Modules)
+                const string allowedModSql = @"
+                    IF OBJECT_ID(N'dbo.Prowess_Client_Modules', N'U') IS NOT NULL
+                        SELECT Module_Id FROM dbo.Prowess_Client_Modules WITH (NOLOCK) WHERE Client_Id = @ClientId;
+                    ELSE IF OBJECT_ID(N'dbo.Client_Modules', N'U') IS NOT NULL
+                        SELECT Module_Id FROM dbo.Client_Modules WITH (NOLOCK) WHERE Client_Id = @ClientId;";
+
+                var allowedModuleIds = new HashSet<int>();
+                using (var modCmd = new SqlCommand(allowedModSql, connection, transaction))
+                {
+                    modCmd.Parameters.AddWithValue("@ClientId", clientId);
+                    using var modReader = await modCmd.ExecuteReaderAsync(cancellationToken);
+                    while (await modReader.ReadAsync(cancellationToken))
+                    {
+                        allowedModuleIds.Add(modReader.GetInt32(0));
+                    }
+                }
+
+                // 2. Fetch module_id for APIs from prowess_api_master
+                const string apiModSql = "SELECT api_master_id, module_id, api_code FROM dbo.prowess_api_master WITH (NOLOCK);";
+                var apiModuleMap = new Dictionary<int, (int ModuleId, string ApiCode)>();
+                using (var apiCmd = new SqlCommand(apiModSql, connection, transaction))
+                {
+                    using var apiReader = await apiCmd.ExecuteReaderAsync(cancellationToken);
+                    while (await apiReader.ReadAsync(cancellationToken))
+                    {
+                        int amid = apiReader.GetInt32(0);
+                        int mid = apiReader.IsDBNull(1) ? 0 : apiReader.GetInt32(1);
+                        string code = apiReader.IsDBNull(2) ? string.Empty : apiReader.GetString(2);
+                        apiModuleMap[amid] = (mid, code);
+                    }
+                }
+
+                // 3. Ensure APIs belong to allowed modules
+                var unauthorizedApis = new List<string>();
+                var authorizedMappings = new List<api_customer_mapping_dto>();
+
+                foreach (var m in authorizedMappings)
+                {
+                    if (m.api_master_id <= 0) continue;
+                    if (apiModuleMap.TryGetValue(m.api_master_id, out var info) && info.ModuleId > 0)
+                    {
+                        if (!allowedModuleIds.Contains(info.ModuleId))
+                        {
+                            unauthorizedApis.Add(string.IsNullOrWhiteSpace(m.api_code) ? info.ApiCode : m.api_code);
+                            continue;
+                        }
+                    }
+                    authorizedMappings.Add(m);
+                }
+
+                if (unauthorizedApis.Count > 0)
+                {
+                    try { transaction.Rollback(); } catch { }
+                    throw new InvalidOperationException(
+                        $"Customer #{clientId} does not have rights for the module(s) containing API(s): {string.Join(", ", unauthorizedApis)}. Assignment rejected.");
+                }
+
+                string targetTable = ResolveTableName();
+                var activeApiMasterIds = authorizedMappings.Select(m => m.api_master_id).Where(id => id > 0).Distinct().ToList();
+
+                string deactivateSql;
+                if (activeApiMasterIds.Count > 0)
+                {
+                    string idList = string.Join(",", activeApiMasterIds);
+                    deactivateSql = $@"
+                        UPDATE dbo.{targetTable}
+                        SET Is_Active = 'N', Modified_By = @UserId, Modified_Date = GETDATE()
+                        WHERE Client_Id = @ClientId AND Api_Master_Id NOT IN ({idList});";
+                }
+                else
+                {
+                    deactivateSql = $@"
+                        UPDATE dbo.{targetTable}
+                        SET Is_Active = 'N', Modified_By = @UserId, Modified_Date = GETDATE()
+                        WHERE Client_Id = @ClientId;";
+                }
+
+                using (var deactCmd = new SqlCommand(deactivateSql, connection, transaction))
+                {
+                    deactCmd.CommandTimeout = 30;
+                    deactCmd.Parameters.AddWithValue("@ClientId", clientId);
+                    deactCmd.Parameters.AddWithValue("@UserId", userId > 0 ? userId : 1);
+                    await deactCmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                string upsertSql = $@"
+                    MERGE dbo.{targetTable} AS target
+                    USING (SELECT @ClientId AS Client_Id, @ApiMasterId AS Api_Master_Id) AS source
+                    ON (target.Client_Id = source.Client_Id AND target.Api_Master_Id = source.Api_Master_Id)
+                    WHEN MATCHED THEN
+                        UPDATE SET 
+                            target.Client_Name = @ClientName,
+                            target.Api_Code = @ApiCode,
+                            target.Onward_Exposure = @OnwardExposure,
+                            target.Consumer_Types = @ConsumerTypes,
+                            target.Max_Data_Scope = @MaxDataScope,
+                            target.Sensitivity = @Sensitivity,
+                            target.Credentials = @Credentials,
+                            target.Max_Rate_Per_Min = @MaxRatePerMin,
+                            target.Monthly_Quota = @MonthlyQuota,
+                            target.Require_Ip_Whitelist = @RequireIpWhitelist,
+                            target.Require_Idempotency_Key = @RequireIdempotencyKey,
+                            target.Sandbox_Available = @SandboxAvailable,
+                            target.Valid_Till = @ValidTill,
+                            target.Is_Active = 'Y',
+                            target.Modified_By = @UserId,
+                            target.Modified_Date = GETDATE()
+                    WHEN NOT MATCHED THEN
+                        INSERT (
+                            Client_Id, Client_Name, Api_Master_Id, Api_Code,
+                            Onward_Exposure, Consumer_Types, Max_Data_Scope, Sensitivity, Credentials,
+                            Max_Rate_Per_Min, Monthly_Quota, Require_Ip_Whitelist, Require_Idempotency_Key,
+                            Sandbox_Available, Valid_Till, Is_Active, Created_By, Created_Date
+                        )
+                        VALUES (
+                            @ClientId, @ClientName, @ApiMasterId, @ApiCode,
+                            @OnwardExposure, @ConsumerTypes, @MaxDataScope, @Sensitivity, @Credentials,
+                            @MaxRatePerMin, @MonthlyQuota, @RequireIpWhitelist, @RequireIdempotencyKey,
+                            @SandboxAvailable, @ValidTill, 'Y', @UserId, GETDATE()
+                        );";
+
+                foreach (var m in authorizedMappings)
+                {
+                    if (m.api_master_id <= 0) continue;
+
+                    using var cmd = new SqlCommand(upsertSql, connection, transaction);
+                    cmd.CommandTimeout = 30;
+                    cmd.Parameters.AddWithValue("@ClientId", clientId);
+                    cmd.Parameters.AddWithValue("@ClientName", (object?)clientName ?? (object?)m.client_name ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("@ApiMasterId", m.api_master_id);
+                    cmd.Parameters.AddWithValue("@ApiCode", (object?)m.api_code ?? string.Empty);
+                    cmd.Parameters.AddWithValue("@OnwardExposure", string.IsNullOrWhiteSpace(m.onward_exposure) ? "Internal" : m.onward_exposure);
+                    cmd.Parameters.AddWithValue("@ConsumerTypes", string.IsNullOrWhiteSpace(m.consumer_types) ? DBNull.Value : (object)m.consumer_types);
+                    cmd.Parameters.AddWithValue("@MaxDataScope", string.IsNullOrWhiteSpace(m.max_data_scope) ? "Own" : m.max_data_scope);
+                    cmd.Parameters.AddWithValue("@Sensitivity", string.IsNullOrWhiteSpace(m.sensitivity) ? "Normal" : m.sensitivity);
+                    cmd.Parameters.AddWithValue("@Credentials", string.IsNullOrWhiteSpace(m.credentials) ? DBNull.Value : (object)m.credentials);
+                    cmd.Parameters.AddWithValue("@MaxRatePerMin", m.max_rate_per_min.HasValue ? (object)m.max_rate_per_min.Value : DBNull.Value);
+                    cmd.Parameters.AddWithValue("@MonthlyQuota", m.monthly_quota.HasValue ? (object)m.monthly_quota.Value : DBNull.Value);
+                    cmd.Parameters.AddWithValue("@RequireIpWhitelist", m.require_ip_whitelist != '\0' ? m.require_ip_whitelist : 'N');
+                    cmd.Parameters.AddWithValue("@RequireIdempotencyKey", m.require_idempotency_key != '\0' ? m.require_idempotency_key : 'N');
+                    cmd.Parameters.AddWithValue("@SandboxAvailable", m.sandbox_available != '\0' ? m.sandbox_available : 'N');
+                    cmd.Parameters.AddWithValue("@ValidTill", m.valid_till.HasValue ? (object)m.valid_till.Value.Date : DBNull.Value);
+                    cmd.Parameters.AddWithValue("@UserId", userId > 0 ? userId : 1);
+
+                    await cmd.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                // Two-phase sync: push to client's HRMS database BEFORE committing local CRM database
+                if (onBeforeCommitAsync != null)
+                {
+                    var (syncSuccess, syncError) = await onBeforeCommitAsync();
+                    if (!syncSuccess)
+                    {
+                        try { transaction.Rollback(); } catch { }
+                        throw new InvalidOperationException($"Sync to Client HRMS database failed: {syncError}. Local CRM changes were rolled back.");
+                    }
+                }
+
+                transaction.Commit();
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                try { transaction.Rollback(); } catch { }
+                return false;
+            }
+            catch
+            {
+                try { transaction.Rollback(); } catch { }
+                throw;
+            }
         }
     }
 }
