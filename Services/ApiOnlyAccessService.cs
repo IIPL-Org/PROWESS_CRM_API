@@ -154,6 +154,7 @@ namespace PROWESS_CRM.Services
                     {
                         api_customer_mapping_id = m.api_customer_mapping_id,
                         api_master_id = m.api_master_id,
+                        module_id = api?.ModuleId,
                         api_code = m.api_code,
                         method_id = api?.MethodId,
                         method_name = api?.MethodName,
