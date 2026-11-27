@@ -1,4 +1,4 @@
-﻿using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations;
 
 namespace PROWESS_CRM.Models
 {
@@ -126,5 +126,18 @@ namespace PROWESS_CRM.Models
         public int client_id { get; set; }
         public string? client_name { get; set; }
         public List<api_customer_mapping_dto> mappings { get; set; } = new();
+    }
+
+    public class ProwessRollbackLogDto
+    {
+        public long LogId { get; set; }
+        public int? ClientId { get; set; }
+        public string? ClientName { get; set; }
+        public string OperationType { get; set; } = "API_CUSTOMER_MAPPING_SAVE";
+        public string Reason { get; set; } = string.Empty;
+        public string? ErrorDetails { get; set; }
+        public string? Payload { get; set; }
+        public int? CreatedBy { get; set; } = 1;
+        public DateTime CreatedDate { get; set; } = DateTime.Now;
     }
 }
