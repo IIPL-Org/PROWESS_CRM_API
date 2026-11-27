@@ -1,4 +1,4 @@
-﻿using System.Security.Claims;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using PROWESS_CRM.Models;
@@ -271,6 +271,26 @@ namespace PROWESS_CRM.Controllers
             {
                 return StatusCode(500, ApiResponse<bool>.FailureResponse(
                     "An error occurred while saving customer mappings.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        [HttpGet("rollback-logs")]
+        [ProducesResponseType(typeof(ApiResponse<IEnumerable<ProwessRollbackLogDto>>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<IEnumerable<ProwessRollbackLogDto>>>> GetRollbackLogs(
+            [FromQuery] int? clientId = null,
+            [FromQuery] int limit = 100,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var logs = await _apiOnlyAccessService.GetRollbackLogsAsync(clientId, limit, cancellationToken);
+                return Ok(ApiResponse<IEnumerable<ProwessRollbackLogDto>>.SuccessResponse(logs));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<IEnumerable<ProwessRollbackLogDto>>.FailureResponse(
+                    "An error occurred while fetching rollback logs.",
                     new List<string> { ex.Message }));
             }
         }

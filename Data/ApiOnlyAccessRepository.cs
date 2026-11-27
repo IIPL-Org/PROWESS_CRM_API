@@ -1,4 +1,4 @@
-﻿using System.Data;
+using System.Data;
 using Microsoft.Data.SqlClient;
 using PROWESS_CRM.Models;
 
@@ -16,6 +16,8 @@ namespace PROWESS_CRM.Data
         Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default);
         Task<bool> save_customer_mappings(int clientId, string? clientName, IEnumerable<api_customer_mapping_dto> mappings, int userId, Func<Task<(bool Success, string Error)>>? onBeforeCommitAsync = null, CancellationToken cancellationToken = default);
         Task<string?> get_client_hrms_link(int clientId, CancellationToken cancellationToken = default);
+        Task<bool> LogRollbackAsync(int? clientId, string? clientName, string operationType, string reason, string? errorDetails = null, string? payload = null, int? userId = null, CancellationToken cancellationToken = default);
+        Task<IEnumerable<ProwessRollbackLogDto>> GetRollbackLogsAsync(int? clientId = null, int limit = 100, CancellationToken cancellationToken = default);
     }
 
     public class ApiOnlyAccessRepository : IApiOnlyAccessRepository
@@ -753,6 +755,12 @@ namespace PROWESS_CRM.Data
             CancellationToken cancellationToken = default)
         {
             var mappingList = mappings?.ToList() ?? new List<api_customer_mapping_dto>();
+            string payloadJson = string.Empty;
+            try
+            {
+                payloadJson = System.Text.Json.JsonSerializer.Serialize(mappingList);
+            }
+            catch { }
 
             using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
             using var transaction = connection.BeginTransaction();
@@ -832,8 +840,9 @@ namespace PROWESS_CRM.Data
                 if (unauthorizedApis.Count > 0)
                 {
                     try { transaction.Rollback(); } catch { }
-                    throw new InvalidOperationException(
-                        $"Customer #{clientId} does not have rights for the module(s) containing API(s): {string.Join(", ", unauthorizedApis)}. Assignment rejected.");
+                    string reason = $"Customer #{clientId} does not have rights for the module(s) containing API(s): {string.Join(", ", unauthorizedApis)}. Assignment rejected.";
+                    await LogRollbackAsync(clientId, clientName, "MODULE_RIGHTS_REJECTED", reason, null, payloadJson, userId, CancellationToken.None);
+                    throw new InvalidOperationException(reason);
                 }
 
                 string targetTable = ResolveTableName();
@@ -933,23 +942,141 @@ namespace PROWESS_CRM.Data
                     if (!syncSuccess)
                     {
                         try { transaction.Rollback(); } catch { }
-                        throw new InvalidOperationException($"Sync to Client HRMS database failed: {syncError}. Local CRM changes were rolled back.");
+                        string reason = $"Sync to Client HRMS database failed: {syncError}. Local CRM changes were rolled back.";
+                        await LogRollbackAsync(clientId, clientName, "HRMS_SYNC_FAILED", reason, syncError, payloadJson, userId, CancellationToken.None);
+                        throw new InvalidOperationException(reason);
                     }
                 }
 
                 transaction.Commit();
                 return true;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
                 try { transaction.Rollback(); } catch { }
+                await LogRollbackAsync(clientId, clientName, "OPERATION_CANCELED", "Operation was cancelled by client or request timed out.", ex.ToString(), payloadJson, userId, CancellationToken.None);
                 return false;
             }
-            catch
+            catch (Exception ex)
             {
                 try { transaction.Rollback(); } catch { }
+                if (ex is not InvalidOperationException)
+                {
+                    await LogRollbackAsync(clientId, clientName, "DATABASE_ERROR", $"Database error during customer mapping save: {ex.Message}", ex.ToString(), payloadJson, userId, CancellationToken.None);
+                }
                 throw;
             }
+        }
+
+        public async Task<bool> LogRollbackAsync(
+            int? clientId,
+            string? clientName,
+            string operationType,
+            string reason,
+            string? errorDetails = null,
+            string? payload = null,
+            int? userId = null,
+            CancellationToken cancellationToken = default)
+        {
+            const string sql = @"
+                IF OBJECT_ID(N'dbo.Prowess_Rollback_Log', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.Prowess_Rollback_Log (
+                        [Log_Id]           BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                        [Client_Id]        INT NULL,
+                        [Client_Name]      NVARCHAR(250) NULL,
+                        [Operation_Type]   VARCHAR(100) NOT NULL,
+                        [Reason]           NVARCHAR(MAX) NOT NULL,
+                        [Error_Details]    NVARCHAR(MAX) NULL,
+                        [Payload]          NVARCHAR(MAX) NULL,
+                        [Created_By]       INT NULL DEFAULT 1,
+                        [Created_Date]     DATETIME NOT NULL DEFAULT GETDATE()
+                    );
+                    CREATE NONCLUSTERED INDEX IX_Prowess_Rollback_Log_ClientId 
+                    ON dbo.Prowess_Rollback_Log (Client_Id, Created_Date DESC);
+                END
+
+                INSERT INTO dbo.Prowess_Rollback_Log (
+                    Client_Id, Client_Name, Operation_Type, Reason, Error_Details, Payload, Created_By, Created_Date
+                )
+                VALUES (
+                    @ClientId, @ClientName, @OperationType, @Reason, @ErrorDetails, @Payload, @CreatedBy, GETDATE()
+                );";
+
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var cmd = new SqlCommand(sql, connection);
+                cmd.CommandTimeout = 15;
+                cmd.Parameters.AddWithValue("@ClientId", (object?)clientId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@ClientName", (object?)clientName ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@OperationType", string.IsNullOrWhiteSpace(operationType) ? "ROLLBACK" : operationType);
+                cmd.Parameters.AddWithValue("@Reason", reason ?? "Unknown rollback reason");
+                cmd.Parameters.AddWithValue("@ErrorDetails", (object?)errorDetails ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@Payload", (object?)payload ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@CreatedBy", (object?)userId ?? 1);
+
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+                Console.WriteLine($"[LogRollbackAsync] 📝 Logged rollback: Client={clientId}, Type={operationType}, Reason={reason}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[LogRollbackAsync] ❌ Failed to write rollback log: {ex.Message}");
+                return false;
+            }
+        }
+
+        public async Task<IEnumerable<ProwessRollbackLogDto>> GetRollbackLogsAsync(
+            int? clientId = null,
+            int limit = 100,
+            CancellationToken cancellationToken = default)
+        {
+            var list = new List<ProwessRollbackLogDto>();
+            string whereClause = clientId.HasValue ? "WHERE Client_Id = @ClientId" : "";
+            string sql = $@"
+                SELECT TOP (@Limit)
+                    Log_Id, Client_Id, Client_Name, Operation_Type, Reason, Error_Details, Payload, Created_By, Created_Date
+                FROM dbo.Prowess_Rollback_Log WITH (NOLOCK)
+                {whereClause}
+                ORDER BY Log_Id DESC;";
+
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var cmd = new SqlCommand(sql, connection);
+                cmd.CommandTimeout = 15;
+                cmd.Parameters.AddWithValue("@Limit", limit > 0 ? limit : 100);
+                if (clientId.HasValue)
+                    cmd.Parameters.AddWithValue("@ClientId", clientId.Value);
+
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    list.Add(new ProwessRollbackLogDto
+                    {
+                        LogId = reader.GetInt64(0),
+                        ClientId = reader.IsDBNull(1) ? null : reader.GetInt32(1),
+                        ClientName = reader.IsDBNull(2) ? null : reader.GetString(2),
+                        OperationType = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                        Reason = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                        ErrorDetails = reader.IsDBNull(5) ? null : reader.GetString(5),
+                        Payload = reader.IsDBNull(6) ? null : reader.GetString(6),
+                        CreatedBy = reader.IsDBNull(7) ? null : reader.GetInt32(7),
+                        CreatedDate = reader.GetDateTime(8)
+                    });
+                }
+            }
+            catch (SqlException ex) when (ex.Number == 208)
+            {
+                // Table does not exist
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GetRollbackLogsAsync] Error: {ex.Message}");
+            }
+
+            return list;
         }
     }
 }

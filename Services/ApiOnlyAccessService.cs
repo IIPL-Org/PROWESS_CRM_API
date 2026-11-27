@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Json;
+using System.Net.Http.Json;
 using Microsoft.Extensions.Logging;
 using PROWESS_CRM.Data;
 using PROWESS_CRM.Models;
@@ -16,6 +16,7 @@ namespace PROWESS_CRM.Services
         Task<IEnumerable<client_master_dto>> get_client_master(CancellationToken cancellationToken = default);
         Task<IEnumerable<api_customer_mapping_dto>> get_customer_mappings(int? clientId = null, CancellationToken cancellationToken = default);
         Task<bool> save_customer_mappings(int clientId, string? clientName, IEnumerable<api_customer_mapping_dto> mappings, int userId, CancellationToken cancellationToken = default);
+        Task<IEnumerable<ProwessRollbackLogDto>> GetRollbackLogsAsync(int? clientId = null, int limit = 100, CancellationToken cancellationToken = default);
     }
 
     public class ApiOnlyAccessService : IApiOnlyAccessService
@@ -223,8 +224,9 @@ namespace PROWESS_CRM.Services
                                     {
                                         string err = doc.RootElement.TryGetProperty("message", out var mProp) ? mProp.GetString() ?? "Sync failed" : "Sync failed";
                                         Console.WriteLine($"[CRM Sync] ⚠️ Remote API returned success=false: {err}");
-                                        lastError = err;
-                                        continue;
+                                        // The remote endpoint was reached and processed the request, but failed.
+                                        // Do not retry other alias routes; return the error immediately to avoid duplicate logs.
+                                        return (false, err);
                                     }
                                 }
                                 catch { }
@@ -238,6 +240,14 @@ namespace PROWESS_CRM.Services
                                 string err = await response.Content.ReadAsStringAsync(cancellationToken);
                                 Console.WriteLine($"[CRM Sync] ⚠️ Attempt to {targetUrl} failed with status {response.StatusCode}: {err}");
                                 lastError = $"Status {(int)response.StatusCode}: {err}";
+
+                                // If the controller returned a server error (500) or bad request (400),
+                                // the endpoint exists but failed internally. Retrying alias routes (/save, /apis)
+                                // would hit the exact same controller and cause duplicate rollback log entries!
+                                if (response.StatusCode != System.Net.HttpStatusCode.NotFound)
+                                {
+                                    return (false, lastError);
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -258,6 +268,11 @@ namespace PROWESS_CRM.Services
                 _logger.LogWarning(ex, "Could not sync customer mappings to Client {ClientId} HRMS link.", clientId);
                 return (false, ex.Message);
             }
+        }
+
+        public async Task<IEnumerable<ProwessRollbackLogDto>> GetRollbackLogsAsync(int? clientId = null, int limit = 100, CancellationToken cancellationToken = default)
+        {
+            return await _apiOnlyAccessRepository.GetRollbackLogsAsync(clientId, limit, cancellationToken);
         }
     }
 }
