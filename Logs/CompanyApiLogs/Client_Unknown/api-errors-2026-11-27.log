@@ -1,0 +1,11 @@
+﻿================================================================================
+[2026-11-27 10:40:53.853] [HTTP 0] [string] [string] string string
+Client       : - - string
+User         : 0 (string) | IP: string | ApiCode: string | LocalLogId: 0
+Source URL   : string
+Query Params : string
+Request Body : string
+Headers      : string
+Error        : string
+Exception    : string
+

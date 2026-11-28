@@ -18,6 +18,11 @@ namespace PROWESS_CRM.Data
         Task<string?> get_client_hrms_link(int clientId, CancellationToken cancellationToken = default);
         Task<bool> LogRollbackAsync(int? clientId, string? clientName, string operationType, string reason, string? errorDetails = null, string? payload = null, int? userId = null, CancellationToken cancellationToken = default);
         Task<IEnumerable<ProwessRollbackLogDto>> GetRollbackLogsAsync(int? clientId = null, int limit = 100, CancellationToken cancellationToken = default);
+        Task<Dictionary<int, string>> GetClientNameMapAsync(CancellationToken cancellationToken = default);
+        Task<int> SaveApiErrorLogsAsync(IEnumerable<(ApiErrorLogItemRequest Item, string? LogFilePath)> entries, int? batchClientId, string? batchClientName, string? batchSourceApiUrl, CancellationToken cancellationToken = default);
+        Task<ApiErrorLogQueryResultDto> GetApiErrorLogsAsync(int? clientId = null, string? environment = null, string? statusFilter = null, string? search = null, DateTime? fromDate = null, DateTime? toDate = null, int page = 1, int pageSize = 50, CancellationToken cancellationToken = default);
+        Task<int> UpsertCustomerApiUsageAsync(CustomerApiUsageSyncRequest request, CancellationToken cancellationToken = default);
+        Task<CustomerApiUsageQueryResultDto> GetCustomerApiUsageAsync(int? clientId = null, int? usageMonth = null, string? search = null, CancellationToken cancellationToken = default);
     }
 
     public class ApiOnlyAccessRepository : IApiOnlyAccessRepository
@@ -1078,5 +1083,700 @@ namespace PROWESS_CRM.Data
 
             return list;
         }
+
+
+
+
+        public async Task<Dictionary<int, string>> GetClientNameMapAsync(CancellationToken cancellationToken = default)
+        {
+            var map = new Dictionary<int, string>();
+            const string sql = "SELECT Client_Id, Client_Name FROM dbo.Client_Master WITH (NOLOCK);";
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                using var cmd = new SqlCommand(sql, connection);
+                cmd.CommandTimeout = 15;
+                using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    int cid = reader.IsDBNull(0) ? 0 : Convert.ToInt32(reader.GetValue(0));
+                    string cname = reader.IsDBNull(1) ? string.Empty : Convert.ToString(reader.GetValue(1))?.Trim() ?? string.Empty;
+                    if (cid > 0 && !string.IsNullOrWhiteSpace(cname))
+                    {
+                        map[cid] = cname;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore if Client_Master lookup fails
+            }
+            return map;
+        }
+
+        private static async Task EnsureApiErrorLogTableAsync(SqlConnection connection, CancellationToken cancellationToken)
+        {
+            const string ddl = @"
+                IF OBJECT_ID(N'dbo.Prowess_Api_Error_Log', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE [dbo].[Prowess_Api_Error_Log] (
+                        [Error_Log_Id]       BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                        [Client_Id]          INT NULL,
+                        [Client_Name]        NVARCHAR(255) NULL,
+                        [Source_Api_Url]     NVARCHAR(500) NULL,
+                        [Local_Log_Id]       BIGINT NULL,
+                        [External_User_Id]   INT NULL,
+                        [External_User_Name] NVARCHAR(150) NULL,
+                        [Api_Master_Id]      INT NULL,
+                        [Api_Code]           NVARCHAR(100) NULL,
+                        [Method_Name]        NVARCHAR(20) NULL,
+                        [Endpoint_Path]      NVARCHAR(500) NOT NULL,
+                        [Environment_Mode]   NVARCHAR(30) NULL,
+                        [Query_Params]       NVARCHAR(MAX) NULL,
+                        [Request_Body]       NVARCHAR(MAX) NULL,
+                        [Request_Headers]    NVARCHAR(MAX) NULL,
+                        [Http_Status]        INT NOT NULL,
+                        [Error_Code]         NVARCHAR(100) NULL,
+                        [Error_Message]      NVARCHAR(MAX) NULL,
+                        [Exception_Detail]   NVARCHAR(MAX) NULL,
+                        [Client_Ip]          NVARCHAR(100) NULL,
+                        [Log_File_Path]      NVARCHAR(500) NULL,
+                        [Occurred_At]        DATETIME NOT NULL,
+                        [Received_Date]      DATETIME NOT NULL CONSTRAINT [DF_CRM_Prowess_Api_Error_Log_ReceivedDate] DEFAULT (GETDATE())
+                    );
+
+                    CREATE NONCLUSTERED INDEX [IX_CRM_Prowess_Api_Error_Log_Client_Date]
+                        ON [dbo].[Prowess_Api_Error_Log] ([Client_Id], [Occurred_At] DESC, [Error_Log_Id] DESC);
+
+                    CREATE NONCLUSTERED INDEX [IX_CRM_Prowess_Api_Error_Log_Status_Env]
+                        ON [dbo].[Prowess_Api_Error_Log] ([Http_Status], [Environment_Mode]);
+                    END
+                ELSE
+                BEGIN
+                    IF COL_LENGTH('dbo.Prowess_Api_Error_Log', 'Source_Api_Url') IS NULL
+                        ALTER TABLE [dbo].[Prowess_Api_Error_Log] ADD [Source_Api_Url] NVARCHAR(500) NULL;
+                    IF COL_LENGTH('dbo.Prowess_Api_Error_Log', 'Local_Log_Id') IS NULL
+                        ALTER TABLE [dbo].[Prowess_Api_Error_Log] ADD [Local_Log_Id] BIGINT NULL;
+                    IF COL_LENGTH('dbo.Prowess_Api_Error_Log', 'Log_File_Path') IS NULL
+                        ALTER TABLE [dbo].[Prowess_Api_Error_Log] ADD [Log_File_Path] NVARCHAR(500) NULL;
+                    IF COL_LENGTH('dbo.Prowess_Api_Error_Log', 'Received_Date') IS NULL
+                        ALTER TABLE [dbo].[Prowess_Api_Error_Log] ADD [Received_Date] DATETIME NOT NULL CONSTRAINT [DF_CRM_Prowess_Api_Error_Log_ReceivedDate_Alt] DEFAULT (GETDATE());
+                END";
+
+            using var cmd = new SqlCommand(ddl, connection);
+            cmd.CommandTimeout = 30;
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        public async Task<int> SaveApiErrorLogsAsync(
+            IEnumerable<(ApiErrorLogItemRequest Item, string? LogFilePath)> entries,
+            int? batchClientId,
+            string? batchClientName,
+            string? batchSourceApiUrl,
+            CancellationToken cancellationToken = default)
+        {
+            var entryList = entries?.ToList() ?? new List<(ApiErrorLogItemRequest Item, string? LogFilePath)>();
+            if (entryList.Count == 0) return 0;
+
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            await EnsureApiErrorLogTableAsync(connection, cancellationToken);
+
+            var clientMap = await GetClientNameMapAsync(cancellationToken);
+
+            const string insertSql = @"
+                IF @LocalLogId IS NOT NULL AND @ClientId IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM dbo.Prowess_Api_Error_Log WITH (NOLOCK) WHERE Client_Id = @ClientId AND Local_Log_Id = @LocalLogId)
+                BEGIN
+                    SELECT 0;
+                    RETURN;
+                END
+
+                INSERT INTO dbo.Prowess_Api_Error_Log (
+                    Client_Id, Client_Name, Source_Api_Url, Local_Log_Id,
+                    External_User_Id, External_User_Name,
+                    Api_Master_Id, Api_Code, Method_Name, Endpoint_Path, Environment_Mode,
+                    Query_Params, Request_Body, Request_Headers,
+                    Http_Status, Error_Code, Error_Message, Exception_Detail,
+                    Client_Ip, Log_File_Path, Occurred_At, Received_Date
+                )
+                VALUES (
+                    @ClientId, @ClientName, @SourceApiUrl, @LocalLogId,
+                    @ExternalUserId, @ExternalUserName,
+                    @ApiMasterId, @ApiCode, @MethodName, @EndpointPath, @EnvironmentMode,
+                    @QueryParams, @RequestBody, @RequestHeaders,
+                    @HttpStatus, @ErrorCode, @ErrorMessage, @ExceptionDetail,
+                    @ClientIp, @LogFilePath, @OccurredAt, GETDATE()
+                );
+                SELECT 1;";
+
+            int inserted = 0;
+            foreach (var (item, logFilePath) in entryList)
+            {
+                int? cid = item.ClientId.HasValue && item.ClientId.Value > 0 ? item.ClientId : batchClientId;
+                string? cname = !string.IsNullOrWhiteSpace(item.ClientName) ? item.ClientName.Trim() : batchClientName?.Trim();
+                if (cid.HasValue && cid.Value > 0 && clientMap.TryGetValue(cid.Value, out var canonicalName) && !string.IsNullOrWhiteSpace(canonicalName))
+                {
+                    cname = canonicalName;
+                }
+                string? sourceUrl = !string.IsNullOrWhiteSpace(item.SourceApiUrl) ? item.SourceApiUrl.Trim() : batchSourceApiUrl?.Trim();
+
+                using var cmd = new SqlCommand(insertSql, connection);
+                cmd.CommandTimeout = 15;
+                cmd.Parameters.AddWithValue("@ClientId", cid.HasValue && cid.Value > 0 ? (object)cid.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@ClientName", string.IsNullOrWhiteSpace(cname) ? DBNull.Value : (object)cname);
+                cmd.Parameters.AddWithValue("@SourceApiUrl", string.IsNullOrWhiteSpace(sourceUrl) ? DBNull.Value : (object)sourceUrl);
+                cmd.Parameters.AddWithValue("@LocalLogId", item.LocalLogId.HasValue && item.LocalLogId.Value > 0 ? (object)item.LocalLogId.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@ExternalUserId", item.UserId.HasValue && item.UserId.Value > 0 ? (object)item.UserId.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@ExternalUserName", string.IsNullOrWhiteSpace(item.UserName) ? DBNull.Value : (object)item.UserName.Trim());
+                cmd.Parameters.AddWithValue("@ApiMasterId", item.ApiMasterId.HasValue && item.ApiMasterId.Value > 0 ? (object)item.ApiMasterId.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@ApiCode", string.IsNullOrWhiteSpace(item.ApiCode) ? DBNull.Value : (object)item.ApiCode.Trim());
+                cmd.Parameters.AddWithValue("@MethodName", string.IsNullOrWhiteSpace(item.MethodName) ? DBNull.Value : (object)item.MethodName.Trim().ToUpperInvariant());
+                cmd.Parameters.AddWithValue("@EndpointPath", string.IsNullOrWhiteSpace(item.EndpointPath) ? "/" : item.EndpointPath.Trim());
+                cmd.Parameters.AddWithValue("@EnvironmentMode", string.IsNullOrWhiteSpace(item.EnvironmentMode) ? DBNull.Value : (object)item.EnvironmentMode.Trim());
+                cmd.Parameters.AddWithValue("@QueryParams", string.IsNullOrWhiteSpace(item.QueryParams) ? DBNull.Value : (object)item.QueryParams);
+                cmd.Parameters.AddWithValue("@RequestBody", string.IsNullOrWhiteSpace(item.RequestBody) ? DBNull.Value : (object)item.RequestBody);
+                cmd.Parameters.AddWithValue("@RequestHeaders", string.IsNullOrWhiteSpace(item.RequestHeaders) ? DBNull.Value : (object)item.RequestHeaders);
+                cmd.Parameters.AddWithValue("@HttpStatus", item.HttpStatus);
+                cmd.Parameters.AddWithValue("@ErrorCode", string.IsNullOrWhiteSpace(item.ErrorCode) ? DBNull.Value : (object)item.ErrorCode.Trim());
+                cmd.Parameters.AddWithValue("@ErrorMessage", string.IsNullOrWhiteSpace(item.ErrorMessage) ? DBNull.Value : (object)item.ErrorMessage);
+                cmd.Parameters.AddWithValue("@ExceptionDetail", string.IsNullOrWhiteSpace(item.ExceptionDetail) ? DBNull.Value : (object)item.ExceptionDetail);
+                cmd.Parameters.AddWithValue("@ClientIp", string.IsNullOrWhiteSpace(item.ClientIp) ? DBNull.Value : (object)item.ClientIp.Trim());
+                cmd.Parameters.AddWithValue("@LogFilePath", string.IsNullOrWhiteSpace(logFilePath) ? DBNull.Value : (object)logFilePath);
+                cmd.Parameters.AddWithValue("@OccurredAt", item.OccurredAt == default ? DateTime.Now : item.OccurredAt);
+
+                var res = await cmd.ExecuteScalarAsync(cancellationToken);
+                if (res != null && res != DBNull.Value && Convert.ToInt32(res) == 1)
+                {
+                    inserted++;
+                }
+            }
+
+            return inserted;
+        }
+
+        public async Task<ApiErrorLogQueryResultDto> GetApiErrorLogsAsync(
+            int? clientId = null,
+            string? environment = null,
+            string? statusFilter = null,
+            string? search = null,
+            DateTime? fromDate = null,
+            DateTime? toDate = null,
+            int page = 1,
+            int pageSize = 50,
+            CancellationToken cancellationToken = default)
+        {
+            page = page < 1 ? 1 : page;
+            pageSize = pageSize < 1 ? 50 : Math.Min(pageSize, 200);
+
+            var result = new ApiErrorLogQueryResultDto
+            {
+                Page = page,
+                PageSize = pageSize
+            };
+
+            try
+            {
+                using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+                await EnsureApiErrorLogTableAsync(connection, cancellationToken);
+
+                var filters = new List<string>();
+                void AddCommonParams(SqlCommand cmd)
+                {
+                    if (clientId.HasValue && clientId.Value > 0)
+                        cmd.Parameters.AddWithValue("@ClientId", clientId.Value);
+                    if (!string.IsNullOrWhiteSpace(environment) && !environment.Equals("All", StringComparison.OrdinalIgnoreCase))
+                        cmd.Parameters.AddWithValue("@Environment", environment.Trim());
+                    if (int.TryParse(statusFilter, out int exactStatus))
+                        cmd.Parameters.AddWithValue("@ExactStatus", exactStatus);
+                    if (fromDate.HasValue)
+                        cmd.Parameters.AddWithValue("@FromDate", fromDate.Value.Date);
+                    if (toDate.HasValue)
+                        cmd.Parameters.AddWithValue("@ToDate", toDate.Value.Date.AddDays(1));
+                    if (!string.IsNullOrWhiteSpace(search))
+                        cmd.Parameters.AddWithValue("@Search", "%" + search.Trim() + "%");
+                }
+
+                if (clientId.HasValue && clientId.Value > 0)
+                    filters.Add("l.Client_Id = @ClientId");
+                if (!string.IsNullOrWhiteSpace(environment) && !environment.Equals("All", StringComparison.OrdinalIgnoreCase))
+                    filters.Add("UPPER(LTRIM(RTRIM(ISNULL(l.Environment_Mode, '')))) = UPPER(@Environment)");
+                if (!string.IsNullOrWhiteSpace(statusFilter) && !statusFilter.Equals("All", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (statusFilter.Equals("4xx", StringComparison.OrdinalIgnoreCase))
+                        filters.Add("l.Http_Status >= 400 AND l.Http_Status < 500");
+                    else if (statusFilter.Equals("5xx", StringComparison.OrdinalIgnoreCase))
+                        filters.Add("l.Http_Status >= 500");
+                    else if (int.TryParse(statusFilter, out _))
+                        filters.Add("l.Http_Status = @ExactStatus");
+                }
+                if (fromDate.HasValue)
+                    filters.Add("l.Occurred_At >= @FromDate");
+                if (toDate.HasValue)
+                    filters.Add("l.Occurred_At < @ToDate");
+                if (!string.IsNullOrWhiteSpace(search))
+                {
+                    filters.Add(@"(
+                        ISNULL(l.Endpoint_Path, '') LIKE @Search OR
+                        ISNULL(l.Error_Code, '') LIKE @Search OR
+                        ISNULL(l.Error_Message, '') LIKE @Search OR
+                        ISNULL(l.External_User_Name, '') LIKE @Search OR
+                        ISNULL(l.Api_Code, '') LIKE @Search OR
+                        ISNULL(l.Query_Params, '') LIKE @Search OR
+                        ISNULL(l.Request_Body, '') LIKE @Search OR
+                        ISNULL(cm.Client_Name, l.Client_Name) LIKE @Search
+                    )");
+                }
+
+                string whereSql = filters.Count > 0 ? "WHERE " + string.Join(" AND ", filters) : "";
+
+                // 1. Summary + TotalCount for current filter
+                string summarySql = $@"
+                    SELECT
+                        COUNT(1) AS TotalCount,
+                        SUM(CASE WHEN l.Http_Status >= 400 AND l.Http_Status < 500 THEN 1 ELSE 0 END) AS ClientErrors4xx,
+                        SUM(CASE WHEN l.Http_Status >= 500 THEN 1 ELSE 0 END) AS ServerErrors5xx,
+                        SUM(CASE WHEN CAST(l.Occurred_At AS DATE) = CAST(GETDATE() AS DATE) THEN 1 ELSE 0 END) AS TodayErrors,
+                        COUNT(DISTINCT l.Client_Id) AS AffectedCompanies
+                    FROM dbo.Prowess_Api_Error_Log l WITH (NOLOCK)
+                    LEFT JOIN dbo.Client_Master cm WITH (NOLOCK) ON cm.Client_Id = l.Client_Id
+                    {whereSql};";
+
+                using (var sumCmd = new SqlCommand(summarySql, connection))
+                {
+                    sumCmd.CommandTimeout = 20;
+                    AddCommonParams(sumCmd);
+                    using var sumRdr = await sumCmd.ExecuteReaderAsync(cancellationToken);
+                    if (await sumRdr.ReadAsync(cancellationToken))
+                    {
+                        result.TotalCount = sumRdr.IsDBNull(0) ? 0 : Convert.ToInt32(sumRdr.GetValue(0));
+                        result.Summary = new ApiErrorLogSummaryDto
+                        {
+                            TotalErrors = result.TotalCount,
+                            ClientErrors4xx = sumRdr.IsDBNull(1) ? 0 : Convert.ToInt32(sumRdr.GetValue(1)),
+                            ServerErrors5xx = sumRdr.IsDBNull(2) ? 0 : Convert.ToInt32(sumRdr.GetValue(2)),
+                            TodayErrors = sumRdr.IsDBNull(3) ? 0 : Convert.ToInt32(sumRdr.GetValue(3)),
+                            AffectedCompanies = sumRdr.IsDBNull(4) ? 0 : Convert.ToInt32(sumRdr.GetValue(4))
+                        };
+                    }
+                }
+
+                // 2. Company-wise error counts (overall so sidebar counts stay populated)
+                const string companyCountSql = @"
+                    SELECT
+                        l.Client_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(cm.Client_Name)), ''), NULLIF(LTRIM(RTRIM(MAX(l.Client_Name))), ''), 'Unknown Company') AS Client_Name,
+                        COUNT(1) AS ErrorCount,
+                        MAX(l.Occurred_At) AS LastErrorAt
+                    FROM dbo.Prowess_Api_Error_Log l WITH (NOLOCK)
+                    LEFT JOIN dbo.Client_Master cm WITH (NOLOCK) ON cm.Client_Id = l.Client_Id
+                    GROUP BY l.Client_Id, cm.Client_Name
+                    ORDER BY MAX(l.Occurred_At) DESC;";
+
+                using (var ccCmd = new SqlCommand(companyCountSql, connection))
+                {
+                    ccCmd.CommandTimeout = 20;
+                    using var ccRdr = await ccCmd.ExecuteReaderAsync(cancellationToken);
+                    while (await ccRdr.ReadAsync(cancellationToken))
+                    {
+                        result.CompanyCounts.Add(new CompanyErrorCountDto
+                        {
+                            ClientId = ccRdr.IsDBNull(0) ? null : Convert.ToInt32(ccRdr.GetValue(0)),
+                            ClientName = ccRdr.IsDBNull(1) ? "Unknown Company" : Convert.ToString(ccRdr.GetValue(1)) ?? "Unknown Company",
+                            ErrorCount = ccRdr.IsDBNull(2) ? 0 : Convert.ToInt32(ccRdr.GetValue(2)),
+                            LastErrorAt = ccRdr.IsDBNull(3) ? null : Convert.ToDateTime(ccRdr.GetValue(3))
+                        });
+                    }
+                }
+
+                // 3. Paginated rows
+                int offset = (page - 1) * pageSize;
+                string rowsSql = $@"
+                    SELECT
+                        l.Error_Log_Id,
+                        l.Client_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(cm.Client_Name)), ''), l.Client_Name) AS Client_Name,
+                        l.Source_Api_Url,
+                        l.Local_Log_Id,
+                        l.External_User_Id,
+                        l.External_User_Name,
+                        l.Api_Master_Id,
+                        l.Api_Code,
+                        l.Method_Name,
+                        l.Endpoint_Path,
+                        l.Environment_Mode,
+                        l.Query_Params,
+                        l.Request_Body,
+                        l.Request_Headers,
+                        l.Http_Status,
+                        l.Error_Code,
+                        l.Error_Message,
+                        l.Exception_Detail,
+                        l.Client_Ip,
+                        l.Log_File_Path,
+                        l.Occurred_At,
+                        l.Received_Date
+                    FROM dbo.Prowess_Api_Error_Log l WITH (NOLOCK)
+                    LEFT JOIN dbo.Client_Master cm WITH (NOLOCK) ON cm.Client_Id = l.Client_Id
+                    {whereSql}
+                    ORDER BY l.Occurred_At DESC, l.Error_Log_Id DESC
+                    OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY;";
+
+                using (var rowsCmd = new SqlCommand(rowsSql, connection))
+                {
+                    rowsCmd.CommandTimeout = 20;
+                    AddCommonParams(rowsCmd);
+                    rowsCmd.Parameters.AddWithValue("@Offset", offset);
+                    rowsCmd.Parameters.AddWithValue("@PageSize", pageSize);
+
+                    using var rdr = await rowsCmd.ExecuteReaderAsync(cancellationToken);
+                    while (await rdr.ReadAsync(cancellationToken))
+                    {
+                        result.Items.Add(new ApiErrorLogDto
+                        {
+                            ErrorLogId = rdr.GetInt64(0),
+                            ClientId = rdr.IsDBNull(1) ? null : Convert.ToInt32(rdr.GetValue(1)),
+                            ClientName = rdr.IsDBNull(2) ? null : Convert.ToString(rdr.GetValue(2)),
+                            SourceApiUrl = rdr.IsDBNull(3) ? null : Convert.ToString(rdr.GetValue(3)),
+                            LocalLogId = rdr.IsDBNull(4) ? null : Convert.ToInt64(rdr.GetValue(4)),
+                            UserId = rdr.IsDBNull(5) ? null : Convert.ToInt32(rdr.GetValue(5)),
+                            UserName = rdr.IsDBNull(6) ? null : Convert.ToString(rdr.GetValue(6)),
+                            ApiMasterId = rdr.IsDBNull(7) ? null : Convert.ToInt32(rdr.GetValue(7)),
+                            ApiCode = rdr.IsDBNull(8) ? null : Convert.ToString(rdr.GetValue(8)),
+                            MethodName = rdr.IsDBNull(9) ? null : Convert.ToString(rdr.GetValue(9)),
+                            EndpointPath = rdr.IsDBNull(10) ? string.Empty : Convert.ToString(rdr.GetValue(10)) ?? string.Empty,
+                            EnvironmentMode = rdr.IsDBNull(11) ? null : Convert.ToString(rdr.GetValue(11)),
+                            QueryParams = rdr.IsDBNull(12) ? null : Convert.ToString(rdr.GetValue(12)),
+                            RequestBody = rdr.IsDBNull(13) ? null : Convert.ToString(rdr.GetValue(13)),
+                            RequestHeaders = rdr.IsDBNull(14) ? null : Convert.ToString(rdr.GetValue(14)),
+                            HttpStatus = rdr.GetInt32(15),
+                            ErrorCode = rdr.IsDBNull(16) ? null : Convert.ToString(rdr.GetValue(16)),
+                            ErrorMessage = rdr.IsDBNull(17) ? null : Convert.ToString(rdr.GetValue(17)),
+                            ExceptionDetail = rdr.IsDBNull(18) ? null : Convert.ToString(rdr.GetValue(18)),
+                            ClientIp = rdr.IsDBNull(19) ? null : Convert.ToString(rdr.GetValue(19)),
+                            LogFilePath = rdr.IsDBNull(20) ? null : Convert.ToString(rdr.GetValue(20)),
+                            OccurredAt = rdr.GetDateTime(21),
+                            ReceivedDate = rdr.GetDateTime(22)
+                        });
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GetApiErrorLogsAsync] Error: {ex.Message}");
+                throw;
+            }
+
+            return result;
+        }
+
+
+        private static async Task EnsureCustomerApiUsageTableAsync(SqlConnection connection, CancellationToken cancellationToken)
+        {
+            const string ddl = @"
+                IF OBJECT_ID(N'dbo.Prowess_Customer_Api_Usage_Monthly', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE [dbo].[Prowess_Customer_Api_Usage_Monthly] (
+                        [Usage_Id]         BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                        [Client_Id]        INT NOT NULL,
+                        [Client_Name]      NVARCHAR(255) NULL,
+                        [Api_Master_Id]    INT NOT NULL,
+                        [Api_Code]         NVARCHAR(100) NULL,
+                        [Method_Name]      NVARCHAR(20) NULL,
+                        [Endpoint_Path]    NVARCHAR(500) NULL,
+                        [Api_Name]         NVARCHAR(255) NULL,
+                        [Usage_Month]      INT NOT NULL,
+                        [Hit_Count]        BIGINT NOT NULL CONSTRAINT [DF_CRM_CustUsage_HitCount] DEFAULT (0),
+                        [Monthly_Quota]    BIGINT NULL,
+                        [Last_Hit_Date]    DATETIME NULL,
+                        [Source_Api_Url]   NVARCHAR(500) NULL,
+                        [Last_Synced_Date] DATETIME NOT NULL CONSTRAINT [DF_CRM_CustUsage_LastSynced] DEFAULT (GETDATE()),
+                        CONSTRAINT [UQ_CRM_Prowess_Customer_Api_Usage_Monthly] UNIQUE ([Client_Id], [Api_Master_Id], [Usage_Month])
+                    );
+
+                    CREATE NONCLUSTERED INDEX [IX_CRM_CustUsage_Month_Client]
+                        ON [dbo].[Prowess_Customer_Api_Usage_Monthly] ([Usage_Month], [Client_Id]);
+                END";
+
+            using var cmd = new SqlCommand(ddl, connection);
+            cmd.CommandTimeout = 30;
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        public async Task<int> UpsertCustomerApiUsageAsync(
+            CustomerApiUsageSyncRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            if (request == null || request.ClientId <= 0 || request.Items == null || request.Items.Count == 0)
+            {
+                return 0;
+            }
+
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            await EnsureCustomerApiUsageTableAsync(connection, cancellationToken);
+
+            var clientMap = await GetClientNameMapAsync(cancellationToken);
+            string? canonicalClientName = clientMap.TryGetValue(request.ClientId, out var cName) && !string.IsNullOrWhiteSpace(cName)
+                ? cName
+                : request.ClientName?.Trim();
+
+            const string upsertSql = @"
+                MERGE dbo.Prowess_Customer_Api_Usage_Monthly AS target
+                USING (SELECT @ClientId AS Client_Id, @ApiMasterId AS Api_Master_Id, @UsageMonth AS Usage_Month) AS src
+                ON (target.Client_Id = src.Client_Id AND target.Api_Master_Id = src.Api_Master_Id AND target.Usage_Month = src.Usage_Month)
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        target.Client_Name      = COALESCE(@ClientName, target.Client_Name),
+                        target.Api_Code         = COALESCE(@ApiCode, target.Api_Code),
+                        target.Method_Name      = COALESCE(@MethodName, target.Method_Name),
+                        target.Endpoint_Path    = COALESCE(@EndpointPath, target.Endpoint_Path),
+                        target.Api_Name         = COALESCE(@ApiName, target.Api_Name),
+                        target.Hit_Count        = @HitCount,
+                        target.Monthly_Quota    = COALESCE(@MonthlyQuota, target.Monthly_Quota),
+                        target.Last_Hit_Date    = COALESCE(@LastHitDate, target.Last_Hit_Date),
+                        target.Source_Api_Url   = COALESCE(@SourceApiUrl, target.Source_Api_Url),
+                        target.Last_Synced_Date = GETDATE()
+                WHEN NOT MATCHED THEN
+                    INSERT (
+                        Client_Id, Client_Name, Api_Master_Id, Api_Code, Method_Name, Endpoint_Path, Api_Name,
+                        Usage_Month, Hit_Count, Monthly_Quota, Last_Hit_Date, Source_Api_Url, Last_Synced_Date
+                    )
+                    VALUES (
+                        @ClientId, @ClientName, @ApiMasterId, @ApiCode, @MethodName, @EndpointPath, @ApiName,
+                        @UsageMonth, @HitCount, @MonthlyQuota, @LastHitDate, @SourceApiUrl, GETDATE()
+                    );";
+
+            int saved = 0;
+            foreach (var item in request.Items)
+            {
+                if (item.ApiMasterId <= 0 || item.UsageMonth <= 0) continue;
+
+                using var cmd = new SqlCommand(upsertSql, connection);
+                cmd.CommandTimeout = 15;
+                cmd.Parameters.AddWithValue("@ClientId", request.ClientId);
+                cmd.Parameters.AddWithValue("@ClientName", string.IsNullOrWhiteSpace(canonicalClientName) ? DBNull.Value : (object)canonicalClientName);
+                cmd.Parameters.AddWithValue("@ApiMasterId", item.ApiMasterId);
+                cmd.Parameters.AddWithValue("@ApiCode", string.IsNullOrWhiteSpace(item.ApiCode) ? DBNull.Value : (object)item.ApiCode.Trim());
+                cmd.Parameters.AddWithValue("@MethodName", string.IsNullOrWhiteSpace(item.MethodName) ? DBNull.Value : (object)item.MethodName.Trim().ToUpperInvariant());
+                cmd.Parameters.AddWithValue("@EndpointPath", string.IsNullOrWhiteSpace(item.EndpointPath) ? DBNull.Value : (object)item.EndpointPath.Trim());
+                cmd.Parameters.AddWithValue("@ApiName", string.IsNullOrWhiteSpace(item.ApiName) ? DBNull.Value : (object)item.ApiName.Trim());
+                cmd.Parameters.AddWithValue("@UsageMonth", item.UsageMonth);
+                cmd.Parameters.AddWithValue("@HitCount", item.HitCount < 0 ? 0 : item.HitCount);
+                cmd.Parameters.AddWithValue("@MonthlyQuota", item.MonthlyQuota.HasValue ? (object)item.MonthlyQuota.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@LastHitDate", item.LastHitDate.HasValue ? (object)item.LastHitDate.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue("@SourceApiUrl", string.IsNullOrWhiteSpace(request.SourceApiUrl) ? DBNull.Value : (object)request.SourceApiUrl.Trim());
+
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+                saved++;
+            }
+
+            return saved;
+        }
+
+        public async Task<CustomerApiUsageQueryResultDto> GetCustomerApiUsageAsync(
+            int? clientId = null,
+            int? usageMonth = null,
+            string? search = null,
+            CancellationToken cancellationToken = default)
+        {
+            int currentMonth = int.Parse(DateTime.Now.ToString("yyyyMM"));
+            int effectiveMonth = usageMonth ?? currentMonth; // 0 = All Months
+
+            var result = new CustomerApiUsageQueryResultDto
+            {
+                UsageMonth = effectiveMonth
+            };
+
+            using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+            await EnsureCustomerApiUsageTableAsync(connection, cancellationToken);
+
+            // 1. Available months
+            var months = new SortedSet<int>(Comparer<int>.Create((a, b) => b.CompareTo(a))) { currentMonth };
+            const string monthsSql = "SELECT DISTINCT Usage_Month FROM dbo.Prowess_Customer_Api_Usage_Monthly WITH (NOLOCK);";
+            using (var mCmd = new SqlCommand(monthsSql, connection))
+            using (var mRdr = await mCmd.ExecuteReaderAsync(cancellationToken))
+            {
+                while (await mRdr.ReadAsync(cancellationToken))
+                {
+                    if (!mRdr.IsDBNull(0)) months.Add(mRdr.GetInt32(0));
+                }
+            }
+            result.AvailableMonths = months.ToList();
+
+            // Resolve mapping table name in CRM DB
+            string mappingTable = "Prowess_Api_Customer_Mapping";
+            using (var tCmd = new SqlCommand(@"
+                IF OBJECT_ID(N'dbo.Prowess_Api_Customer_Mapping', N'U') IS NOT NULL SELECT 'Prowess_Api_Customer_Mapping';
+                ELSE IF OBJECT_ID(N'dbo.ApiCustomerMapping', N'U') IS NOT NULL SELECT 'ApiCustomerMapping';
+                ELSE SELECT '';", connection))
+            {
+                mappingTable = Convert.ToString(await tCmd.ExecuteScalarAsync(cancellationToken)) ?? string.Empty;
+            }
+
+            // 2. Load customer-wise usage rows (combining active licensed mappings + recorded usage)
+            var allRows = new List<CustomerApiUsageDto>();
+
+            if (effectiveMonth > 0 && !string.IsNullOrEmpty(mappingTable))
+            {
+                string sql = $@"
+                    SELECT
+                        COALESCE(u.Client_Id, m.Client_Id) AS Client_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(cm.Client_Name)), ''), NULLIF(LTRIM(RTRIM(u.Client_Name)), ''), NULLIF(LTRIM(RTRIM(m.Client_Name)), ''), 'Client #' + CAST(COALESCE(u.Client_Id, m.Client_Id) AS VARCHAR(20))) AS Client_Name,
+                        COALESCE(u.Api_Master_Id, m.Api_Master_Id) AS Api_Master_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.api_code)), ''), NULLIF(LTRIM(RTRIM(m.Api_Code)), ''), u.Api_Code, '') AS Api_Code,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.method_name)), ''), u.Method_Name, '') AS Method_Name,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.endpoint_path)), ''), u.Endpoint_Path, '') AS Endpoint_Path,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.api_name)), ''), u.Api_Name, '') AS Api_Name,
+                        @TargetMonth AS Usage_Month,
+                        ISNULL(u.Hit_Count, 0) AS Hit_Count,
+                        COALESCE(m.Monthly_Quota, u.Monthly_Quota) AS Monthly_Quota,
+                        u.Last_Hit_Date,
+                        u.Last_Synced_Date,
+                        u.Source_Api_Url
+                    FROM (
+                        SELECT * FROM dbo.{mappingTable} WITH (NOLOCK)
+                        WHERE UPPER(LTRIM(RTRIM(ISNULL(Is_Active, 'Y')))) = 'Y'
+                    ) m
+                    FULL OUTER JOIN (
+                        SELECT * FROM dbo.Prowess_Customer_Api_Usage_Monthly WITH (NOLOCK)
+                        WHERE Usage_Month = @TargetMonth
+                    ) u
+                        ON u.Client_Id = m.Client_Id AND u.Api_Master_Id = m.Api_Master_Id
+                    LEFT JOIN dbo.Client_Master cm WITH (NOLOCK)
+                        ON cm.Client_Id = COALESCE(u.Client_Id, m.Client_Id)
+                    LEFT JOIN dbo.prowess_api_master am WITH (NOLOCK)
+                        ON am.api_master_id = COALESCE(u.Api_Master_Id, m.Api_Master_Id)
+                    WHERE COALESCE(u.Client_Id, m.Client_Id) IS NOT NULL
+                    ORDER BY ISNULL(u.Hit_Count, 0) DESC, Client_Name ASC, Api_Code ASC;";
+
+                using var cmd = new SqlCommand(sql, connection);
+                cmd.CommandTimeout = 25;
+                cmd.Parameters.AddWithValue("@TargetMonth", effectiveMonth);
+                using var rdr = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await rdr.ReadAsync(cancellationToken))
+                {
+                    allRows.Add(MapCustomerUsageRow(rdr));
+                }
+            }
+            else
+            {
+                string monthWhere = effectiveMonth > 0 ? "WHERE u.Usage_Month = @TargetMonth" : "";
+                string joinMap = !string.IsNullOrEmpty(mappingTable)
+                    ? $"LEFT JOIN dbo.{mappingTable} m WITH (NOLOCK) ON m.Client_Id = u.Client_Id AND m.Api_Master_Id = u.Api_Master_Id AND UPPER(LTRIM(RTRIM(ISNULL(m.Is_Active, 'Y')))) = 'Y'"
+                    : "";
+                string quotaExpr = !string.IsNullOrEmpty(mappingTable) ? "COALESCE(m.Monthly_Quota, u.Monthly_Quota)" : "u.Monthly_Quota";
+
+                string sql = $@"
+                    SELECT
+                        u.Client_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(cm.Client_Name)), ''), NULLIF(LTRIM(RTRIM(u.Client_Name)), ''), 'Client #' + CAST(u.Client_Id AS VARCHAR(20))) AS Client_Name,
+                        u.Api_Master_Id,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.api_code)), ''), u.Api_Code, '') AS Api_Code,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.method_name)), ''), u.Method_Name, '') AS Method_Name,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.endpoint_path)), ''), u.Endpoint_Path, '') AS Endpoint_Path,
+                        COALESCE(NULLIF(LTRIM(RTRIM(am.api_name)), ''), u.Api_Name, '') AS Api_Name,
+                        u.Usage_Month,
+                        u.Hit_Count,
+                        {quotaExpr} AS Monthly_Quota,
+                        u.Last_Hit_Date,
+                        u.Last_Synced_Date,
+                        u.Source_Api_Url
+                    FROM dbo.Prowess_Customer_Api_Usage_Monthly u WITH (NOLOCK)
+                    {joinMap}
+                    LEFT JOIN dbo.Client_Master cm WITH (NOLOCK) ON cm.Client_Id = u.Client_Id
+                    LEFT JOIN dbo.prowess_api_master am WITH (NOLOCK) ON am.api_master_id = u.Api_Master_Id
+                    {monthWhere}
+                    ORDER BY u.Usage_Month DESC, u.Hit_Count DESC, Client_Name ASC;";
+
+                using var cmd = new SqlCommand(sql, connection);
+                cmd.CommandTimeout = 25;
+                if (effectiveMonth > 0) cmd.Parameters.AddWithValue("@TargetMonth", effectiveMonth);
+                using var rdr = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await rdr.ReadAsync(cancellationToken))
+                {
+                    allRows.Add(MapCustomerUsageRow(rdr));
+                }
+            }
+
+            // Build CompanySummaries across all clients (before clientId filter so sidebar stays complete)
+            result.CompanySummaries = allRows
+                .GroupBy(r => new { r.ClientId, r.ClientName })
+                .Select(g => new CompanyUsageSummaryDto
+                {
+                    ClientId = g.Key.ClientId,
+                    ClientName = g.Key.ClientName,
+                    TotalHits = g.Sum(x => x.HitCount),
+                    TotalQuota = g.Sum(x => x.MonthlyQuota ?? 0),
+                    ApiCount = g.Select(x => x.ApiMasterId).Distinct().Count(),
+                    LastHitDate = g.Max(x => x.LastHitDate)
+                })
+                .OrderByDescending(c => c.TotalHits)
+                .ThenBy(c => c.ClientName)
+                .ToList();
+
+            // Apply clientId & search filters for Items + Summary
+            IEnumerable<CustomerApiUsageDto> filtered = allRows;
+            if (clientId.HasValue && clientId.Value > 0)
+            {
+                filtered = filtered.Where(r => r.ClientId == clientId.Value);
+            }
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                string q = search.Trim();
+                filtered = filtered.Where(r =>
+                    r.ClientName.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    r.ApiCode.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    r.ApiName.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    r.EndpointPath.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+                    r.MethodName.Contains(q, StringComparison.OrdinalIgnoreCase));
+            }
+
+            var filteredList = filtered.ToList();
+            result.Items = filteredList;
+            result.Summary = new CustomerApiUsageSummaryDto
+            {
+                TotalHits = filteredList.Sum(x => x.HitCount),
+                TotalQuota = filteredList.Sum(x => x.MonthlyQuota ?? 0),
+                ActiveApisUsed = filteredList.Count(x => x.HitCount > 0),
+                TotalLicensedApis = filteredList.Count,
+                CustomersWithUsage = filteredList.Where(x => x.HitCount > 0).Select(x => x.ClientId).Distinct().Count(),
+                NearOrOverLimitCount = filteredList.Count(x => x.UsagePercent.HasValue && x.UsagePercent.Value >= 80.0)
+            };
+
+            return result;
+        }
+
+        private static CustomerApiUsageDto MapCustomerUsageRow(SqlDataReader rdr)
+        {
+            long hitCount = rdr.IsDBNull(8) ? 0 : Convert.ToInt64(rdr.GetValue(8));
+            long? quota = rdr.IsDBNull(9) ? null : Convert.ToInt64(rdr.GetValue(9));
+            long? remaining = quota.HasValue ? Math.Max(0, quota.Value - hitCount) : null;
+            double? pct = quota.HasValue && quota.Value > 0
+                ? Math.Round((double)hitCount * 100.0 / quota.Value, 1)
+                : null;
+
+            return new CustomerApiUsageDto
+            {
+                ClientId = rdr.GetInt32(0),
+                ClientName = rdr.IsDBNull(1) ? string.Empty : Convert.ToString(rdr.GetValue(1)) ?? string.Empty,
+                ApiMasterId = rdr.GetInt32(2),
+                ApiCode = rdr.IsDBNull(3) ? string.Empty : Convert.ToString(rdr.GetValue(3)) ?? string.Empty,
+                MethodName = rdr.IsDBNull(4) ? string.Empty : Convert.ToString(rdr.GetValue(4)) ?? string.Empty,
+                EndpointPath = rdr.IsDBNull(5) ? string.Empty : Convert.ToString(rdr.GetValue(5)) ?? string.Empty,
+                ApiName = rdr.IsDBNull(6) ? string.Empty : Convert.ToString(rdr.GetValue(6)) ?? string.Empty,
+                UsageMonth = rdr.IsDBNull(7) ? 0 : Convert.ToInt32(rdr.GetValue(7)),
+                HitCount = hitCount,
+                MonthlyQuota = quota,
+                RemainingQuota = remaining,
+                UsagePercent = pct,
+                LastHitDate = rdr.IsDBNull(10) ? null : rdr.GetDateTime(10),
+                LastSyncedDate = rdr.IsDBNull(11) ? null : rdr.GetDateTime(11),
+                SourceApiUrl = rdr.IsDBNull(12) ? null : Convert.ToString(rdr.GetValue(12))
+            };
+        }
+
+
+
+
+
     }
 }

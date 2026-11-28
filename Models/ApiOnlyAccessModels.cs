@@ -1,4 +1,7 @@
+
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
+
 
 namespace PROWESS_CRM.Models
 {
@@ -140,4 +143,262 @@ namespace PROWESS_CRM.Models
         public int? CreatedBy { get; set; } = 1;
         public DateTime CreatedDate { get; set; } = DateTime.Now;
     }
+
+
+    public class ApiErrorLogBatchRequest
+    {
+        [JsonPropertyName("client_id")]
+        public int? ClientId { get; set; }
+
+        [JsonPropertyName("client_name")]
+        public string? ClientName { get; set; }
+
+        [JsonPropertyName("source_api_url")]
+        public string? SourceApiUrl { get; set; }
+
+        [JsonPropertyName("logs")]
+        public List<ApiErrorLogItemRequest> Logs { get; set; } = new();
+    }
+
+    public class ApiErrorLogItemRequest
+    {
+        [JsonPropertyName("local_log_id")]
+        public long? LocalLogId { get; set; }
+
+        [JsonPropertyName("client_id")]
+        public int? ClientId { get; set; }
+
+        [JsonPropertyName("client_name")]
+        public string? ClientName { get; set; }
+
+        [JsonPropertyName("source_api_url")]
+        public string? SourceApiUrl { get; set; }
+
+        [JsonPropertyName("user_id")]
+        public int? UserId { get; set; }
+
+        [JsonPropertyName("user_name")]
+        public string? UserName { get; set; }
+
+        [JsonPropertyName("api_master_id")]
+        public int? ApiMasterId { get; set; }
+
+        [JsonPropertyName("api_code")]
+        public string? ApiCode { get; set; }
+
+        [JsonPropertyName("method_name")]
+        public string? MethodName { get; set; }
+
+        [JsonPropertyName("endpoint_path")]
+        public string EndpointPath { get; set; } = string.Empty;
+
+        [JsonPropertyName("environment_mode")]
+        public string? EnvironmentMode { get; set; }
+
+        [JsonPropertyName("query_params")]
+        public string? QueryParams { get; set; }
+
+        [JsonPropertyName("request_body")]
+        public string? RequestBody { get; set; }
+
+        [JsonPropertyName("request_headers")]
+        public string? RequestHeaders { get; set; }
+
+        [JsonPropertyName("http_status")]
+        public int HttpStatus { get; set; }
+
+        [JsonPropertyName("error_code")]
+        public string? ErrorCode { get; set; }
+
+        [JsonPropertyName("error_message")]
+        public string? ErrorMessage { get; set; }
+
+        [JsonPropertyName("exception_detail")]
+        public string? ExceptionDetail { get; set; }
+
+        [JsonPropertyName("client_ip")]
+        public string? ClientIp { get; set; }
+
+        [JsonPropertyName("occurred_at")]
+        public DateTime OccurredAt { get; set; } = DateTime.Now;
+    }
+
+    public class ApiErrorLogDto
+    {
+        public long ErrorLogId { get; set; }
+        public int? ClientId { get; set; }
+        public string? ClientName { get; set; }
+        public string? SourceApiUrl { get; set; }
+        public long? LocalLogId { get; set; }
+        public int? UserId { get; set; }
+        public string? UserName { get; set; }
+        public int? ApiMasterId { get; set; }
+        public string? ApiCode { get; set; }
+        public string? MethodName { get; set; }
+        public string EndpointPath { get; set; } = string.Empty;
+        public string? EnvironmentMode { get; set; }
+        public string? QueryParams { get; set; }
+        public string? RequestBody { get; set; }
+        public string? RequestHeaders { get; set; }
+        public int HttpStatus { get; set; }
+        public string? ErrorCode { get; set; }
+        public string? ErrorMessage { get; set; }
+        public string? ExceptionDetail { get; set; }
+        public string? ClientIp { get; set; }
+        public string? LogFilePath { get; set; }
+        public DateTime OccurredAt { get; set; }
+        public DateTime ReceivedDate { get; set; }
+    }
+
+    public class ApiErrorLogSummaryDto
+    {
+        public int TotalErrors { get; set; }
+        public int ClientErrors4xx { get; set; }
+        public int ServerErrors5xx { get; set; }
+        public int TodayErrors { get; set; }
+        public int AffectedCompanies { get; set; }
+    }
+
+    public class CompanyErrorCountDto
+    {
+        public int? ClientId { get; set; }
+        public string ClientName { get; set; } = string.Empty;
+        public int ErrorCount { get; set; }
+        public DateTime? LastErrorAt { get; set; }
+    }
+
+    public class ApiErrorLogQueryResultDto
+    {
+        public List<ApiErrorLogDto> Items { get; set; } = new();
+        public int TotalCount { get; set; }
+        public int Page { get; set; }
+        public int PageSize { get; set; }
+        public ApiErrorLogSummaryDto Summary { get; set; } = new();
+        public List<CompanyErrorCountDto> CompanyCounts { get; set; } = new();
+    }
+
+    public class ApiErrorLogIngestResultDto
+    {
+        public int InsertedCount { get; set; }
+        public List<string> LogFiles { get; set; } = new();
+    }
+
+    public class CompanyLogFileDto
+    {
+        public int? ClientId { get; set; }
+        public string ClientName { get; set; } = string.Empty;
+        public string FolderName { get; set; } = string.Empty;
+        public string FileName { get; set; } = string.Empty;
+        public string RelativePath { get; set; } = string.Empty;
+        public long SizeBytes { get; set; }
+        public DateTime LastModifiedUtc { get; set; }
+    }
+
+    public class CompanyLogFileContentDto
+    {
+        public int? ClientId { get; set; }
+        public string ClientName { get; set; } = string.Empty;
+        public string FileName { get; set; } = string.Empty;
+        public string RelativePath { get; set; } = string.Empty;
+        public long SizeBytes { get; set; }
+        public int TotalLines { get; set; }
+        public string Content { get; set; } = string.Empty;
+    }
+
+
+    public class CustomerApiUsageSyncRequest
+    {
+        [JsonPropertyName("client_id")]
+        public int ClientId { get; set; }
+
+        [JsonPropertyName("client_name")]
+        public string? ClientName { get; set; }
+
+        [JsonPropertyName("source_api_url")]
+        public string? SourceApiUrl { get; set; }
+
+        [JsonPropertyName("items")]
+        public List<CustomerApiUsageSyncItem> Items { get; set; } = new();
+    }
+
+    public class CustomerApiUsageSyncItem
+    {
+        [JsonPropertyName("api_master_id")]
+        public int ApiMasterId { get; set; }
+
+        [JsonPropertyName("api_code")]
+        public string? ApiCode { get; set; }
+
+        [JsonPropertyName("method_name")]
+        public string? MethodName { get; set; }
+
+        [JsonPropertyName("endpoint_path")]
+        public string? EndpointPath { get; set; }
+
+        [JsonPropertyName("api_name")]
+        public string? ApiName { get; set; }
+
+        [JsonPropertyName("monthly_quota")]
+        public long? MonthlyQuota { get; set; }
+
+        [JsonPropertyName("usage_month")]
+        public int UsageMonth { get; set; }
+
+        [JsonPropertyName("hit_count")]
+        public long HitCount { get; set; }
+
+        [JsonPropertyName("last_hit_date")]
+        public DateTime? LastHitDate { get; set; }
+    }
+
+    public class CustomerApiUsageDto
+    {
+        public int ClientId { get; set; }
+        public string ClientName { get; set; } = string.Empty;
+        public int ApiMasterId { get; set; }
+        public string ApiCode { get; set; } = string.Empty;
+        public string MethodName { get; set; } = string.Empty;
+        public string EndpointPath { get; set; } = string.Empty;
+        public string ApiName { get; set; } = string.Empty;
+        public int UsageMonth { get; set; }
+        public long HitCount { get; set; }
+        public long? MonthlyQuota { get; set; }
+        public long? RemainingQuota { get; set; }
+        public double? UsagePercent { get; set; }
+        public DateTime? LastHitDate { get; set; }
+        public DateTime? LastSyncedDate { get; set; }
+        public string? SourceApiUrl { get; set; }
+    }
+
+    public class CustomerApiUsageSummaryDto
+    {
+        public long TotalHits { get; set; }
+        public long TotalQuota { get; set; }
+        public int ActiveApisUsed { get; set; }
+        public int TotalLicensedApis { get; set; }
+        public int CustomersWithUsage { get; set; }
+        public int NearOrOverLimitCount { get; set; }
+    }
+
+    public class CompanyUsageSummaryDto
+    {
+        public int ClientId { get; set; }
+        public string ClientName { get; set; } = string.Empty;
+        public long TotalHits { get; set; }
+        public long TotalQuota { get; set; }
+        public int ApiCount { get; set; }
+        public DateTime? LastHitDate { get; set; }
+    }
+
+    public class CustomerApiUsageQueryResultDto
+    {
+        public int UsageMonth { get; set; }
+        public List<int> AvailableMonths { get; set; } = new();
+        public CustomerApiUsageSummaryDto Summary { get; set; } = new();
+        public List<CompanyUsageSummaryDto> CompanySummaries { get; set; } = new();
+        public List<CustomerApiUsageDto> Items { get; set; } = new();
+    }
+
+
+
 }

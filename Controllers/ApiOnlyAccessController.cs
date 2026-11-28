@@ -1,5 +1,10 @@
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
+
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+
 using Microsoft.Data.SqlClient;
 using PROWESS_CRM.Models;
 using PROWESS_CRM.Services;
@@ -12,10 +17,17 @@ namespace PROWESS_CRM.Controllers
     public class ApiOnlyAccessController : ControllerBase
     {
         private readonly IApiOnlyAccessService _apiOnlyAccessService;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<ApiOnlyAccessController> _logger;
 
-        public ApiOnlyAccessController(IApiOnlyAccessService apiOnlyAccessService)
+        public ApiOnlyAccessController(
+            IApiOnlyAccessService apiOnlyAccessService,
+            IConfiguration configuration,
+            ILogger<ApiOnlyAccessController> logger)
         {
             _apiOnlyAccessService = apiOnlyAccessService;
+            _configuration = configuration;
+            _logger = logger;
         }
 
         /// <summary>
@@ -294,5 +306,218 @@ namespace PROWESS_CRM.Controllers
                     new List<string> { ex.Message }));
             }
         }
+
+        /// <summary>
+        /// Receives failed external API call logs from ProwessBackend, writes them to company-wise log files
+        /// and persists them in dbo.Prowess_Api_Error_Log.
+        /// </summary>
+        [HttpPost("error-logs")]
+        [AllowAnonymous]
+        [ProducesResponseType(typeof(ApiResponse<ApiErrorLogIngestResultDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<ApiErrorLogIngestResultDto>>> IngestApiErrorLogs(
+            [FromBody] ApiErrorLogBatchRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                string? configuredKey = _configuration["CrmSync:ApiKey"];
+                if (!string.IsNullOrWhiteSpace(configuredKey))
+                {
+                    string providedKey = Request.Headers["X-CRM-Sync-Key"].ToString();
+                    if (!string.Equals(configuredKey.Trim(), providedKey.Trim(), StringComparison.Ordinal))
+                    {
+                        return Unauthorized(ApiResponse<ApiErrorLogIngestResultDto>.FailureResponse("Invalid X-CRM-Sync-Key."));
+                    }
+                }
+
+                if (request == null || request.Logs == null || request.Logs.Count == 0)
+                {
+                    return BadRequest(ApiResponse<ApiErrorLogIngestResultDto>.FailureResponse("No error log entries provided."));
+                }
+
+                var result = await _apiOnlyAccessService.IngestApiErrorLogsAsync(request, cancellationToken);
+                _logger.LogInformation(
+                    "Ingested {InsertedCount} API error log(s) for ClientId={ClientId}. Files={Files}",
+                    result.InsertedCount,
+                    request.ClientId,
+                    string.Join(", ", result.LogFiles));
+                return Ok(ApiResponse<ApiErrorLogIngestResultDto>.SuccessResponse(result, "API error logs recorded."));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to record API error logs for ClientId={ClientId}", request?.ClientId);
+
+                return StatusCode(500, ApiResponse<ApiErrorLogIngestResultDto>.FailureResponse(
+                    "An error occurred while recording API error logs.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        /// <summary>
+        /// Retrieves company-wise failed external API logs with filtering, summary KPIs, and pagination.
+        /// </summary>
+        [HttpGet("error-logs")]
+        [ProducesResponseType(typeof(ApiResponse<ApiErrorLogQueryResultDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<ApiErrorLogQueryResultDto>>> GetApiErrorLogs(
+            [FromQuery] int? clientId = null,
+            [FromQuery] string? environment = null,
+            [FromQuery] string? statusFilter = null,
+            [FromQuery] string? search = null,
+            [FromQuery] DateTime? fromDate = null,
+            [FromQuery] DateTime? toDate = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var result = await _apiOnlyAccessService.GetApiErrorLogsAsync(
+                    clientId, environment, statusFilter, search, fromDate, toDate, page, pageSize, cancellationToken);
+                return Ok(ApiResponse<ApiErrorLogQueryResultDto>.SuccessResponse(result));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<ApiErrorLogQueryResultDto>.FailureResponse(
+                    "An error occurred while fetching API error logs.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        /// <summary>
+        /// Lists physical company-wise .log files stored on the CRM server.
+        /// </summary>
+        [HttpGet("error-log-files")]
+        [ProducesResponseType(typeof(ApiResponse<IEnumerable<CompanyLogFileDto>>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<IEnumerable<CompanyLogFileDto>>>> GetCompanyLogFiles(
+            [FromQuery] int? clientId = null,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var files = await _apiOnlyAccessService.GetCompanyLogFilesAsync(clientId, cancellationToken);
+                return Ok(ApiResponse<IEnumerable<CompanyLogFileDto>>.SuccessResponse(files));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<IEnumerable<CompanyLogFileDto>>.FailureResponse(
+                    "An error occurred while listing company log files.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        /// <summary>
+        /// Reads the contents of a company-wise .log file for display in CRM.
+        /// </summary>
+        [HttpGet("error-log-files/content")]
+        [ProducesResponseType(typeof(ApiResponse<CompanyLogFileContentDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<CompanyLogFileContentDto>>> GetCompanyLogFileContent(
+            [FromQuery] int? clientId,
+            [FromQuery] string fileName,
+            [FromQuery] int tailLines = 500,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var content = await _apiOnlyAccessService.ReadCompanyLogFileAsync(clientId, fileName, tailLines, cancellationToken);
+                if (content == null)
+                {
+                    return NotFound(ApiResponse<CompanyLogFileContentDto>.FailureResponse("Log file not found."));
+                }
+                return Ok(ApiResponse<CompanyLogFileContentDto>.SuccessResponse(content));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<CompanyLogFileContentDto>.FailureResponse(
+                    "An error occurred while reading the company log file.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        /// <summary>
+        /// Downloads a company-wise .log file as text/plain.
+        /// </summary>
+        [HttpGet("error-log-files/download")]
+        public async Task<IActionResult> DownloadCompanyLogFile(
+            [FromQuery] int? clientId,
+            [FromQuery] string fileName,
+            CancellationToken cancellationToken = default)
+        {
+            var fileResult = await _apiOnlyAccessService.ReadCompanyLogFileBytesAsync(clientId, fileName, cancellationToken);
+            if (fileResult == null)
+            {
+                return NotFound(ApiResponse<string>.FailureResponse("Log file not found."));
+            }
+
+            return File(fileResult.Value.Bytes, "text/plain; charset=utf-8", fileResult.Value.FileName);
+        }
+
+
+
+        /// <summary>
+        /// Receives aggregated monthly API usage totals per customer from ProwessBackend.
+        /// </summary>
+        [HttpPost("usage-sync")]
+        [AllowAnonymous]
+        [ProducesResponseType(typeof(ApiResponse<int>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<int>>> SyncCustomerApiUsage(
+            [FromBody] CustomerApiUsageSyncRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                string? configuredKey = _configuration["CrmSync:ApiKey"];
+                if (!string.IsNullOrWhiteSpace(configuredKey))
+                {
+                    string providedKey = Request.Headers["X-CRM-Sync-Key"].ToString();
+                    if (!string.Equals(configuredKey.Trim(), providedKey.Trim(), StringComparison.Ordinal))
+                    {
+                        return Unauthorized(ApiResponse<int>.FailureResponse("Invalid X-CRM-Sync-Key."));
+                    }
+                }
+
+                if (request == null || request.ClientId <= 0)
+                {
+                    return BadRequest(ApiResponse<int>.FailureResponse("Valid client_id is required."));
+                }
+
+                int saved = await _apiOnlyAccessService.UpsertCustomerApiUsageAsync(request, cancellationToken);
+                _logger.LogInformation("Synced {Count} customer API usage row(s) for ClientId={ClientId}.", saved, request.ClientId);
+                return Ok(ApiResponse<int>.SuccessResponse(saved, "Customer API monthly usage synced successfully."));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to sync customer API usage for ClientId={ClientId}", request?.ClientId);
+                return StatusCode(500, ApiResponse<int>.FailureResponse(
+                    "An error occurred while syncing customer API usage.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+        /// <summary>
+        /// Retrieves customer-wise monthly API usage totals (aggregated across all users) vs licensed Monthly_Quota.
+        /// </summary>
+        [HttpGet("customer-usage")]
+        [ProducesResponseType(typeof(ApiResponse<CustomerApiUsageQueryResultDto>), StatusCodes.Status200OK)]
+        public async Task<ActionResult<ApiResponse<CustomerApiUsageQueryResultDto>>> GetCustomerApiUsage(
+            [FromQuery] int? clientId = null,
+            [FromQuery] int? usageMonth = null,
+            [FromQuery] string? search = null,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var result = await _apiOnlyAccessService.GetCustomerApiUsageAsync(clientId, usageMonth, search, cancellationToken);
+                return Ok(ApiResponse<CustomerApiUsageQueryResultDto>.SuccessResponse(result));
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, ApiResponse<CustomerApiUsageQueryResultDto>.FailureResponse(
+                    "An error occurred while fetching customer API usage.",
+                    new List<string> { ex.Message }));
+            }
+        }
+
+
+
     }
 }
